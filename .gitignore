@@ -1,6 +1,8 @@
 node_modules/
-.env*
+.env
 *test*
 pnpm*
 implementation.md
 ApiHash.py
+data/
+*.session
