@@ -7,16 +7,23 @@ let bot;
 export async function startBot() {
   const db = getDb();
 
-  // Restore source channel from DB on startup
-  const source = db.prepare("SELECT * FROM source_groups WHERE type = 'channel' LIMIT 1").get();
-  let sourceChatId = source ? source.chat_id : null;
-  if (sourceChatId) console.log(`Source channel restored: ${source.title || source.chat_id}`);
+  const sources = getSourceGroups(db);
+  if (sources.length > 0) {
+    console.log(`Source chats restored: ${sources.map((source) => source.title || source.chat_id).join(', ')}`);
+  }
 
   bot = new Bot(config.botToken);
 
   bot.use(async (ctx, next) => {
-    try { await next(); }
-    catch (err) { console.error('Bot error:', err.message); }
+    attachResponseLogging(ctx);
+    logIncomingUpdate(ctx);
+
+    try {
+      await next();
+    } catch (err) {
+      logBotError(ctx, err);
+      throw err;
+    }
   });
 
   bot.command('start', (ctx) => {
@@ -39,16 +46,22 @@ export async function startBot() {
     if (ctx.from.id !== config.ownerUserId) {
       return ctx.reply('⛔ Only the bot owner can use this command.');
     }
-    const chatId = Number(ctx.match?.trim());
-    if (!chatId) {
-      return ctx.reply('Usage: `/join -1001234567890`', { parse_mode: 'Markdown' });
+    const input = ctx.match?.trim();
+    const chatRef = normalizeChatRef(input);
+    if (!chatRef) {
+      return ctx.reply(
+        'Usage:\n'
+        + '`/join -1001234567890`\n'
+        + '`/join @channelusername`\n'
+        + '`/join https://t.me/channelusername`\n\n'
+        + 'Use a public username link or numeric chat ID.',
+        { parse_mode: 'Markdown' }
+      );
     }
     try {
-      const chat = await ctx.api.getChat(chatId);
+      const chat = await ctx.api.getChat(chatRef);
       const db = getDb();
-      db.prepare(
-        "INSERT OR REPLACE INTO source_groups (chat_id, title, type) VALUES (?, ?, ?)"
-      ).run(chat.id, chat.title || null, chat.type === 'channel' ? 'channel' : 'supergroup');
+      saveSourceGroup(db, chat);
       ctx.reply(
         `✅ Source set to: ${chat.title || chat.id} (${chat.type})\n\n`
         + 'Now add `API_ID`, `API_HASH`, `SESSION_STRING` to .env and run:\n'
@@ -401,10 +414,7 @@ export async function startBot() {
     // Channel: bot must be admin, save as source
     if (chat.type === 'channel' && status === 'administrator') {
       const db = getDb();
-      db.prepare(
-        "INSERT OR REPLACE INTO source_groups (chat_id, title, type) VALUES (?, ?, 'channel')"
-      ).run(chat.id, chat.title || null);
-      sourceChatId = chat.id;
+      saveSourceGroup(db, chat);
       console.log(`Source channel auto-detected: ${chat.title} (${chat.id})`);
       try { await ctx.api.sendMessage(chat.id, '✅ Cine will index files from this channel.'); } catch {}
       return;
@@ -424,35 +434,30 @@ export async function startBot() {
     // Removed: clean up if this was the source channel
     if (status === 'left' || status === 'kicked') {
       const db = getDb();
-      const current = db.prepare("SELECT chat_id FROM source_groups WHERE type = 'channel' LIMIT 1").get();
-      if (current?.chat_id === chat.id) {
-        db.prepare("DELETE FROM source_groups").run();
-        sourceChatId = null;
-        console.log(`Source channel removed: ${chat.id}`);
-      }
+      removeSourceGroup(db, chat.id);
+      console.log(`Source chat removed: ${chat.id}`);
     }
   });
 
   // ── /source ────────────────────────────────────────────
   bot.command('source', async (ctx) => {
     const db = getDb();
-    const channel = db.prepare("SELECT * FROM source_groups WHERE type = 'channel' LIMIT 1").get();
-    if (!channel) {
+    const sources = getSourceGroups(db);
+    if (sources.length === 0) {
       return ctx.reply(
-        '❌ No source channel set.\n\n'
+        '❌ No source chats set.\n\n'
         + '1. Add me as **admin** to a Telegram channel\n'
         + '2. I will auto-detect it\n'
-        + '3. Or use `/join <channel_id>` manually\n\n'
-        + 'I also respond to commands from any group or DM.',
+        + '3. Or use `/join <chat_id or t.me link>` manually\n\n'
+        + 'I index from every saved source chat.',
         { parse_mode: 'Markdown' }
       );
     }
+    const lines = sources.map((source, index) =>
+      `${index + 1}. ${source.title || 'Unknown'}\n   ID: \`${source.chat_id}\`\n   Type: ${source.type}\n   Since: ${source.joined_at || 'Unknown'}`
+    );
     ctx.reply(
-      `📁 **Source Channel**\n\n`
-      + `Title: ${channel.title || 'Unknown'}\n`
-      + `Chat ID: \`${channel.chat_id}\`\n`
-      + `Since: ${channel.joined_at || 'Unknown'}\n\n`
-      + `Send \`/request <title>\` from any chat to search files.`,
+      `📁 **Source Chats**\n\n${lines.join('\n\n')}\n\nSend \`/request <title>\` from any chat to search files.`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -495,7 +500,7 @@ export async function startBot() {
   // ── New-message indexing: channel posts ────────────────
   bot.on('channel_post', async (ctx) => {
     const msg = ctx.channelPost;
-    if (!sourceChatId || ctx.chat.id !== sourceChatId) return;
+    if (!isSourceChat(getDb(), ctx.chat.id)) return;
 
     const file = msg.document || msg.video || msg.audio;
     if (!file) return;
@@ -509,7 +514,7 @@ export async function startBot() {
   // ── New-message indexing: supergroup messages (legacy) ──
   bot.on('message', async (ctx) => {
     const msg = ctx.message;
-    if (!sourceChatId || ctx.chat.id !== sourceChatId) return;
+    if (!isSourceChat(getDb(), ctx.chat.id)) return;
 
     const file = msg.document || msg.video || msg.audio;
     if (!file) return;
@@ -562,4 +567,137 @@ function formatSize(bytes) {
   let i = 0; let size = bytes;
   while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
   return `${size.toFixed(1)} ${units[i]}`;
+}
+
+function attachResponseLogging(ctx) {
+  const originalReply = ctx.reply.bind(ctx);
+  ctx.reply = async (...args) => {
+    logOutgoing('reply', ctx, args[0]);
+    return originalReply(...args);
+  };
+
+  const originalEditMessageText = ctx.editMessageText?.bind(ctx);
+  if (originalEditMessageText) {
+    ctx.editMessageText = async (...args) => {
+      logOutgoing('editMessageText', ctx, args[0]);
+      return originalEditMessageText(...args);
+    };
+  }
+
+  const originalAnswerCallbackQuery = ctx.answerCallbackQuery?.bind(ctx);
+  if (originalAnswerCallbackQuery) {
+    ctx.answerCallbackQuery = async (...args) => {
+      logOutgoing('answerCallbackQuery', ctx, args[0] || '[no text]');
+      return originalAnswerCallbackQuery(...args);
+    };
+  }
+}
+
+function logIncomingUpdate(ctx) {
+  const chat = formatChat(ctx.chat);
+  const user = formatUser(ctx.from);
+
+  if (ctx.message?.text) {
+    console.log(`[incoming] message ${chat} ${user} ${truncateText(ctx.message.text)}`);
+    return;
+  }
+
+  if (ctx.callbackQuery?.data) {
+    console.log(`[incoming] callback ${chat} ${user} ${truncateText(ctx.callbackQuery.data)}`);
+    return;
+  }
+
+  if (ctx.channelPost) {
+    const file = ctx.channelPost.document || ctx.channelPost.video || ctx.channelPost.audio;
+    const name = file?.file_name || file?.file_id || 'non-file post';
+    console.log(`[incoming] channel_post ${chat} ${truncateText(name)}`);
+    return;
+  }
+
+  if (ctx.myChatMember) {
+    console.log(
+      `[incoming] my_chat_member ${chat} status=${ctx.myChatMember.new_chat_member.status}`
+    );
+  }
+}
+
+function logOutgoing(type, ctx, payload) {
+  console.log(`[outgoing] ${type} ${formatChat(ctx.chat)} ${truncateText(stringifyPayload(payload))}`);
+}
+
+function logBotError(ctx, err) {
+  console.error(
+    `[error] ${formatChat(ctx.chat)} ${formatUser(ctx.from)} ${err?.stack || err?.message || err}`
+  );
+}
+
+function formatChat(chat) {
+  if (!chat) return '[chat unknown]';
+  return `[chat ${chat.id}${chat.title ? ` ${chat.title}` : ''}]`;
+}
+
+function formatUser(user) {
+  if (!user) return '[user unknown]';
+  const name = [user.first_name, user.last_name].filter(Boolean).join(' ').trim();
+  return `[user ${user.id}${name ? ` ${name}` : ''}]`;
+}
+
+function stringifyPayload(payload) {
+  if (typeof payload === 'string') return payload;
+  if (payload == null) return '';
+  return JSON.stringify(payload);
+}
+
+function truncateText(value, max = 160) {
+  const text = String(value).replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function normalizeChatRef(input) {
+  if (!input) return null;
+
+  const trimmed = input.trim();
+  if (/^-?\d+$/.test(trimmed)) return Number(trimmed);
+
+  const username = extractTelegramUsername(trimmed);
+  return username ? `@${username}` : null;
+}
+
+function extractTelegramUsername(input) {
+  const trimmed = input.trim();
+
+  if (/^@[a-zA-Z0-9_]{5,}$/.test(trimmed)) {
+    return trimmed.slice(1);
+  }
+
+  const match = trimmed.match(
+    /^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]{5,})(?:\/)?(?:\?.*)?$/i
+  );
+  return match ? match[1] : null;
+}
+
+function getSourceGroups(db) {
+  return db.prepare(`
+    SELECT *
+    FROM source_groups
+    ORDER BY type, datetime(joined_at) DESC, rowid DESC
+  `).all();
+}
+
+function isSourceChat(db, chatId) {
+  const row = db.prepare("SELECT 1 FROM source_groups WHERE chat_id = ? LIMIT 1").get(chatId);
+  return Boolean(row);
+}
+
+function saveSourceGroup(db, chat) {
+  const chatType = chat.type === 'channel' ? 'channel' : 'supergroup';
+
+  db.prepare(`
+    INSERT OR REPLACE INTO source_groups (chat_id, title, type, joined_at)
+    VALUES (?, ?, ?, datetime('now'))
+  `).run(chat.id, chat.title || null, chatType);
+}
+
+function removeSourceGroup(db, chatId) {
+  db.prepare("DELETE FROM source_groups WHERE chat_id = ?").run(chatId);
 }
