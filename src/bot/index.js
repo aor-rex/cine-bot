@@ -5,9 +5,11 @@ import { initScan } from '../init-scan.js';
 
 let bot;
 let initScanRunning = false;
+let ownerStatusNotifiedOffline = false;
 const EPISODES_PER_PAGE = 10;
 const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
 const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
+const interactiveMessageOwners = new Map();
 
 export async function startBot() {
   const db = getDb();
@@ -20,10 +22,16 @@ export async function startBot() {
   bot = new Bot(config.botToken);
 
   await registerBotCommands(bot);
+  registerShutdownNotifications(bot);
 
   bot.use(async (ctx, next) => {
     attachResponseLogging(ctx);
     logIncomingUpdate(ctx);
+
+    if (ctx.callbackQuery && !canUseInteractiveMessage(ctx)) {
+      await ctx.answerCallbackQuery('oops, this is not your request');
+      return;
+    }
 
     try {
       await next();
@@ -169,10 +177,12 @@ export async function startBot() {
       }
       keyboard.text('❌ Cancel', 'cancel');
 
-      return ctx.reply(
+      const sent = await ctx.reply(
         `🔎 No exact matches for "${query}".\n\nDid you mean one of these?`,
         { reply_markup: keyboard, parse_mode: 'Markdown' }
       );
+      trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
+      return;
     }
 
     const groups = new Map();
@@ -191,9 +201,10 @@ export async function startBot() {
     }
     keyboard.text('❌ Cancel', 'cancel');
 
-    ctx.reply(`📁 **${results.length} result(s) for "${query}":**`, {
+    const sent = await ctx.reply(`📁 **${results.length} result(s) for "${query}":**`, {
       reply_markup: keyboard, parse_mode: 'Markdown',
     });
+    trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
   });
 
   // ── Title selected ─────────────────────────────────────
@@ -361,6 +372,7 @@ export async function startBot() {
 
   bot.callbackQuery('cancel', async (ctx) => {
     await ctx.editMessageText('❌ Cancelled.');
+    clearInteractiveMessage(ctx);
     await ctx.answerCallbackQuery();
   });
 
@@ -509,6 +521,7 @@ export async function startBot() {
 
   // ── Start ──────────────────────────────────────────────
   console.log('Bot started. Polling...');
+  await notifyOwnerBotStatus(bot, '✅ bot is active.');
   bot.start();
 }
 
@@ -629,6 +642,9 @@ async function forwardItems(ctx, items) {
       for (const msgId of fileIds) {
         try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
       }
+      try {
+        await ctx.api.sendMessage(targetChatId, '🗑 file has been deleted.');
+      } catch {}
     }, deleteDelay);
   }
 }
@@ -643,6 +659,31 @@ function getAutoDeleteDelayMs() {
 
 function formatAutoDeleteMinutes(ms) {
   return (ms / 60_000).toFixed(1);
+}
+
+function trackInteractiveMessage(chatId, messageId, userId) {
+  interactiveMessageOwners.set(`${chatId}:${messageId}`, userId);
+}
+
+function clearInteractiveMessage(ctx) {
+  const key = getInteractiveMessageKey(ctx);
+  if (key) interactiveMessageOwners.delete(key);
+}
+
+function canUseInteractiveMessage(ctx) {
+  const key = getInteractiveMessageKey(ctx);
+  if (!key) return true;
+
+  const ownerId = interactiveMessageOwners.get(key);
+  if (!ownerId) return true;
+  return ownerId === ctx.from?.id;
+}
+
+function getInteractiveMessageKey(ctx) {
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+  if (!chatId || !messageId) return null;
+  return `${chatId}:${messageId}`;
 }
 
 function getSeasonQualityGroups(id, season) {
@@ -668,6 +709,32 @@ function formatInitScanSummary(result) {
   }
 
   return lines.join('\n');
+}
+
+function registerShutdownNotifications(bot) {
+  const handleShutdown = async (signal) => {
+    if (ownerStatusNotifiedOffline) return;
+    ownerStatusNotifiedOffline = true;
+
+    try {
+      await notifyOwnerBotStatus(bot, `⚠️ bot is offline (${signal}).`);
+    } catch {}
+
+    process.exit(0);
+  };
+
+  process.once('SIGINT', () => {
+    handleShutdown('SIGINT');
+  });
+
+  process.once('SIGTERM', () => {
+    handleShutdown('SIGTERM');
+  });
+}
+
+async function notifyOwnerBotStatus(bot, text) {
+  if (!config.ownerUserId) return;
+  await bot.api.sendMessage(config.ownerUserId, text);
 }
 
 function formatSize(bytes) {
