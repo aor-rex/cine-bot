@@ -14,13 +14,15 @@ export async function initScan() {
   }
 
   const db = getDb();
-  const group = db.prepare("SELECT * FROM source_groups LIMIT 1").get();
-  if (!group) {
-    console.error('No source group found. Run /join first via the bot.');
+  const groups = db.prepare(`
+    SELECT *
+    FROM source_groups
+    ORDER BY datetime(joined_at) DESC, rowid DESC
+  `).all();
+  if (groups.length === 0) {
+    console.error('No source groups found. Run /join first via the bot.');
     process.exit(1);
   }
-
-  const chatId = group.chat_id;
 
   const client = new TelegramClient(
     new StringSession(sessionString),
@@ -32,15 +34,9 @@ export async function initScan() {
   await client.connect();
 
   if (!(await client.isUserAuthorized())) {
-    console.error('Not authorized. Create a session string first: see scripts/login.js');
+    console.error('Not authorized. Create a session string first with: node src/login.js');
     process.exit(1);
   }
-
-  console.log(`Scanning group ${chatId} (${group.title || 'unknown'})...`);
-
-  const entity = await client.getEntity(chatId);
-  let count = 0;
-  let batch = [];
 
   const insertStmt = db.prepare(`
     INSERT OR IGNORE INTO media_index
@@ -50,44 +46,89 @@ export async function initScan() {
        source_chat_id, source_msg_id, raw_filename)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const messageExistsStmt = db.prepare(
+    "SELECT id FROM media_index WHERE source_chat_id = ? AND source_msg_id = ?"
+  );
+  const duplicateFileStmt = db.prepare(
+    "SELECT id, source_chat_id FROM media_index WHERE raw_filename = ? LIMIT 1"
+  );
 
-  for await (const msg of client.iterMessages(entity, { limit: 200 })) {
-    const filename = getFilename(msg);
-    if (!filename) continue;
+  let totalIndexed = 0;
+  let totalSkippedDuplicates = 0;
 
-    const alreadyIndexed = db.prepare(
-      "SELECT id FROM media_index WHERE source_chat_id = ? AND source_msg_id = ?"
-    ).get(chatId, msg.id);
-    if (alreadyIndexed) continue;
+  for (const group of groups) {
+    const chatId = group.chat_id;
+    console.log(`Scanning group ${chatId} (${group.title || 'unknown'})...`);
 
-    const parsed = parseFilename(filename);
-    if (!parsed) continue;
+    const entity = await client.getEntity(chatId);
+    let groupIndexed = 0;
+    let groupSkippedDuplicates = 0;
+    let batch = [];
 
-    const fileSize = msg.file?.size || 0;
+    for await (const msg of client.iterMessages(entity)) {
+      const filename = getFilename(msg);
+      if (!filename) continue;
 
-    batch.push([
-      parsed.title, parsed.year || null, parsed.season || null, parsed.episode || null,
-      parsed.resolution || null, parsed.source || null, parsed.codec || null,
-      parsed.audio || null, parsed.channels || null, parsed.language || null,
-      parsed.group || null, parsed.file_type || 'video',
-      parsed.package_id || null, parsed.part_number || null, fileSize,
-      chatId, msg.id, filename,
-    ]);
+      const alreadyIndexed = messageExistsStmt.get(chatId, msg.id);
+      if (alreadyIndexed) continue;
 
-    count++;
+      const duplicateFile = duplicateFileStmt.get(filename);
+      if (duplicateFile) {
+        groupSkippedDuplicates++;
+        totalSkippedDuplicates++;
+        continue;
+      }
 
-    if (batch.length >= 50) {
-      db.transaction((rows) => { for (const r of rows) insertStmt.run(...r); })(batch);
-      batch = [];
-      console.log(`  Indexed ${count} files so far...`);
+      const parsed = parseFilename(filename);
+      if (!parsed) continue;
+
+      const fileSize = normalizeDbValue(msg.file?.size || 0);
+
+      batch.push([
+        normalizeDbValue(parsed.title),
+        normalizeDbValue(parsed.year || null),
+        normalizeDbValue(parsed.season || null),
+        normalizeDbValue(parsed.episode || null),
+        normalizeDbValue(parsed.resolution || null),
+        normalizeDbValue(parsed.source || null),
+        normalizeDbValue(parsed.codec || null),
+        normalizeDbValue(parsed.audio || null),
+        normalizeDbValue(parsed.channels || null),
+        normalizeDbValue(parsed.language || null),
+        normalizeDbValue(parsed.group || null),
+        normalizeDbValue(parsed.file_type || 'video'),
+        normalizeDbValue(parsed.package_id || null),
+        normalizeDbValue(parsed.part_number || null),
+        fileSize,
+        normalizeDbValue(chatId),
+        normalizeDbValue(msg.id),
+        normalizeDbValue(filename),
+      ]);
+
+      groupIndexed++;
+      totalIndexed++;
+
+      if (batch.length >= 50) {
+        db.transaction((rows) => { for (const r of rows) insertStmt.run(...r); })(batch);
+        batch = [];
+        console.log(`  Indexed ${groupIndexed} files so far from ${group.title || chatId}...`);
+      }
     }
+
+    if (batch.length > 0) {
+      db.transaction((rows) => { for (const r of rows) insertStmt.run(...r); })(batch);
+    }
+
+    console.log(
+      `✅ Group scan complete for ${group.title || chatId}. Indexed ${groupIndexed} new files`
+      + (groupSkippedDuplicates ? `, skipped ${groupSkippedDuplicates} duplicates.` : '.')
+    );
   }
 
-  if (batch.length > 0) {
-    db.transaction((rows) => { for (const r of rows) insertStmt.run(...r); })(batch);
-  }
-
-  console.log(`✅ Scan complete. Indexed ${count} new files.`);
+  console.log(
+    `✅ All scans complete. Indexed ${totalIndexed} new files`
+    + (totalSkippedDuplicates ? `, skipped ${totalSkippedDuplicates} duplicates.` : '.')
+  );
   await client.disconnect();
 }
 
@@ -96,4 +137,14 @@ function getFilename(msg) {
     if (msg.document || msg.video) return msg.file.name;
   }
   return null;
+}
+
+function normalizeDbValue(value) {
+  if (value == null) return null;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') {
+    return value;
+  }
+  if (Buffer.isBuffer(value)) return value;
+  if (Array.isArray(value)) return value.join(', ');
+  return String(value);
 }

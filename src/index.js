@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { getDb } from './db/index.js';
 
 const command = process.argv[2];

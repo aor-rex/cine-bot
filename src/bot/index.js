@@ -14,6 +14,8 @@ export async function startBot() {
 
   bot = new Bot(config.botToken);
 
+  await registerBotCommands(bot);
+
   bot.use(async (ctx, next) => {
     attachResponseLogging(ctx);
     logIncomingUpdate(ctx);
@@ -475,6 +477,14 @@ export async function startBot() {
     ).get(chatId, msgId);
     if (exists) return;
 
+    const duplicate = db.prepare(
+      "SELECT id, source_chat_id FROM media_index WHERE raw_filename = ? LIMIT 1"
+    ).get(filename);
+    if (duplicate) {
+      console.log(`Skipped duplicate file from ${chatId}: ${filename}`);
+      return;
+    }
+
     const { parseFilename } = await import('../parser/index.js');
     const parsed = parseFilename(filename);
     if (!parsed) return;
@@ -487,12 +497,24 @@ export async function startBot() {
          source_chat_id, source_msg_id, raw_filename)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      parsed.title, parsed.year || null, parsed.season || null, parsed.episode || null,
-      parsed.resolution || null, parsed.source || null, parsed.codec || null,
-      parsed.audio || null, parsed.channels || null, parsed.language || null,
-      parsed.group || null, parsed.file_type, parsed.package_id || null,
-      parsed.part_number || null, file.file_size || 0,
-      chatId, msgId, filename
+      normalizeDbValue(parsed.title),
+      normalizeDbValue(parsed.year || null),
+      normalizeDbValue(parsed.season || null),
+      normalizeDbValue(parsed.episode || null),
+      normalizeDbValue(parsed.resolution || null),
+      normalizeDbValue(parsed.source || null),
+      normalizeDbValue(parsed.codec || null),
+      normalizeDbValue(parsed.audio || null),
+      normalizeDbValue(parsed.channels || null),
+      normalizeDbValue(parsed.language || null),
+      normalizeDbValue(parsed.group || null),
+      normalizeDbValue(parsed.file_type),
+      normalizeDbValue(parsed.package_id || null),
+      normalizeDbValue(parsed.part_number || null),
+      normalizeDbValue(file.file_size || 0),
+      normalizeDbValue(chatId),
+      normalizeDbValue(msgId),
+      normalizeDbValue(filename)
     );
     console.log(`Indexed: ${filename}`);
   }
@@ -653,6 +675,16 @@ function truncateText(value, max = 160) {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
+function normalizeDbValue(value) {
+  if (value == null) return null;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint') {
+    return value;
+  }
+  if (Buffer.isBuffer(value)) return value;
+  if (Array.isArray(value)) return value.join(', ');
+  return String(value);
+}
+
 function normalizeChatRef(input) {
   if (!input) return null;
 
@@ -674,6 +706,33 @@ function extractTelegramUsername(input) {
     /^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]{5,})(?:\/)?(?:\?.*)?$/i
   );
   return match ? match[1] : null;
+}
+
+async function registerBotCommands(bot) {
+  await bot.api.setMyCommands([
+    { command: 'start', description: 'Start the bot' },
+    { command: 'request', description: 'Search for a movie or series' },
+    { command: 'cancel', description: 'Cancel the current action' },
+  ]);
+
+  await bot.api.setMyCommands(
+    [
+      { command: 'start', description: 'Start the bot' },
+      { command: 'request', description: 'Search for a movie or series' },
+      { command: 'cancel', description: 'Cancel the current action' },
+      { command: 'source', description: 'Show saved source chats' },
+      { command: 'myid', description: 'Show your Telegram user ID' },
+      { command: 'join', description: 'Add a source chat by ID or link' },
+    ],
+    {
+      scope: {
+        type: 'chat',
+        chat_id: config.ownerUserId,
+      },
+    }
+  );
+
+  console.log('Bot command menu registered.');
 }
 
 function getSourceGroups(db) {

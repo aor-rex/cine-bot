@@ -52,6 +52,7 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_media_season ON media_index(season);
     CREATE INDEX IF NOT EXISTS idx_media_type ON media_index(file_type);
     CREATE INDEX IF NOT EXISTS idx_media_package ON media_index(package_id);
+    CREATE INDEX IF NOT EXISTS idx_media_raw_filename ON media_index(raw_filename);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
       title, episode_title, release_group,
