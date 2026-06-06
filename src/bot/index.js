@@ -6,6 +6,8 @@ import { initScan } from '../init-scan.js';
 let bot;
 let initScanRunning = false;
 const EPISODES_PER_PAGE = 10;
+const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
+const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
 
 export async function startBot() {
   const db = getDb();
@@ -588,7 +590,6 @@ async function renderSeasonEpisodePage(ctx, items, season, page) {
 async function forwardItems(ctx, items) {
   const db = getDb();
   const targetChatId = ctx.chat.id;
-  const isGroup = targetChatId !== ctx.from.id;
 
   let sent = 0;
   let failed = 0;
@@ -601,13 +602,13 @@ async function forwardItems(ctx, items) {
           "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
         ).all(item.package_id);
         for (const p of parts) {
-          const m = await ctx.api.forwardMessage(targetChatId, p.source_chat_id, p.source_msg_id);
-          if (isGroup) fileIds.push(m.message_id);
+          const m = await ctx.api.copyMessage(targetChatId, p.source_chat_id, p.source_msg_id);
+          fileIds.push(m.message_id);
           await delay(200);
         }
       } else {
-        const m = await ctx.api.forwardMessage(targetChatId, item.source_chat_id, item.source_msg_id);
-        if (isGroup) fileIds.push(m.message_id);
+        const m = await ctx.api.copyMessage(targetChatId, item.source_chat_id, item.source_msg_id);
+        fileIds.push(m.message_id);
       }
       sent++;
     } catch {
@@ -618,21 +619,30 @@ async function forwardItems(ctx, items) {
   }
 
   const errPart = failed > 0 ? ` (${failed} failed)` : '';
+  const deleteDelay = getAutoDeleteDelayMs();
   await ctx.editMessageText(
-    `✅ Forwarded ${sent}/${items.length} files${errPart}${isGroup ? '. Save video privately — auto-deletes in 30s.' : ''}`
+    `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.`
   );
 
-  if (isGroup && fileIds.length) {
+  if (fileIds.length) {
     setTimeout(async () => {
       for (const msgId of fileIds) {
         try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
       }
-    }, 30_000);
+    }, deleteDelay);
   }
 }
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getAutoDeleteDelayMs() {
+  return MIN_AUTO_DELETE_MS + Math.floor(Math.random() * (MAX_AUTO_DELETE_MS - MIN_AUTO_DELETE_MS + 1));
+}
+
+function formatAutoDeleteMinutes(ms) {
+  return (ms / 60_000).toFixed(1);
 }
 
 function getSeasonQualityGroups(id, season) {

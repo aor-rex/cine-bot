@@ -6,3 +6,5 @@ implementation.md
 ApiHash.py
 data/
 *.session
+.codex/
+.agents/
