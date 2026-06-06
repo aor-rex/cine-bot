@@ -7,9 +7,10 @@ let bot;
 let initScanRunning = false;
 let ownerStatusNotifiedOffline = false;
 const EPISODES_PER_PAGE = 10;
+const REQUEST_UI_TTL_MS = 3 * 60 * 1000;
 const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
 const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
-const interactiveMessageOwners = new Map();
+const interactiveMessages = new Map();
 
 export async function startBot() {
   const db = getDb();
@@ -29,8 +30,12 @@ export async function startBot() {
     logIncomingUpdate(ctx);
 
     if (ctx.callbackQuery && !canUseInteractiveMessage(ctx)) {
-      await ctx.answerCallbackQuery('oops, this is not your request');
+      await ctx.answerCallbackQuery('this is not your request');
       return;
+    }
+
+    if (ctx.callbackQuery) {
+      refreshInteractiveMessage(ctx);
     }
 
     try {
@@ -634,7 +639,7 @@ async function forwardItems(ctx, items) {
   const errPart = failed > 0 ? ` (${failed} failed)` : '';
   const deleteDelay = getAutoDeleteDelayMs();
   await ctx.editMessageText(
-    `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.`
+    `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.\n\nSave the files to **Saved Messages** before they are deleted.`
   );
 
   if (fileIds.length) {
@@ -662,21 +667,36 @@ function formatAutoDeleteMinutes(ms) {
 }
 
 function trackInteractiveMessage(chatId, messageId, userId) {
-  interactiveMessageOwners.set(`${chatId}:${messageId}`, userId);
+  const key = `${chatId}:${messageId}`;
+  const existing = interactiveMessages.get(key);
+  if (existing?.timeoutId) clearTimeout(existing.timeoutId);
+
+  const timeoutId = setTimeout(async () => {
+    try {
+      await bot.api.deleteMessage(chatId, messageId);
+    } catch {}
+    interactiveMessages.delete(key);
+  }, REQUEST_UI_TTL_MS);
+
+  interactiveMessages.set(key, { ownerId: userId, timeoutId });
 }
 
 function clearInteractiveMessage(ctx) {
   const key = getInteractiveMessageKey(ctx);
-  if (key) interactiveMessageOwners.delete(key);
+  if (!key) return;
+
+  const entry = interactiveMessages.get(key);
+  if (entry?.timeoutId) clearTimeout(entry.timeoutId);
+  interactiveMessages.delete(key);
 }
 
 function canUseInteractiveMessage(ctx) {
   const key = getInteractiveMessageKey(ctx);
   if (!key) return true;
 
-  const ownerId = interactiveMessageOwners.get(key);
-  if (!ownerId) return true;
-  return ownerId === ctx.from?.id;
+  const entry = interactiveMessages.get(key);
+  if (!entry) return true;
+  return entry.ownerId === ctx.from?.id;
 }
 
 function getInteractiveMessageKey(ctx) {
@@ -684,6 +704,17 @@ function getInteractiveMessageKey(ctx) {
   const messageId = ctx.callbackQuery?.message?.message_id;
   if (!chatId || !messageId) return null;
   return `${chatId}:${messageId}`;
+}
+
+function refreshInteractiveMessage(ctx) {
+  const key = getInteractiveMessageKey(ctx);
+  if (!key) return;
+
+  const entry = interactiveMessages.get(key);
+  if (!entry) return;
+
+  const [chatId, messageId] = key.split(':');
+  trackInteractiveMessage(Number(chatId), Number(messageId), entry.ownerId);
 }
 
 function getSeasonQualityGroups(id, season) {
