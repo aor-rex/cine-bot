@@ -1,8 +1,10 @@
 import { Bot, InlineKeyboard } from 'grammy';
 import { config } from '../config.js';
 import { getDb } from '../db/index.js';
+import { initScan } from '../init-scan.js';
 
 let bot;
+let initScanRunning = false;
 
 export async function startBot() {
   const db = getDb();
@@ -29,18 +31,72 @@ export async function startBot() {
   });
 
   bot.command('start', (ctx) => {
-    ctx.reply(
+    const isPrivate = ctx.chat?.type === 'private';
+    const isOwner = ctx.from?.id === config.ownerUserId;
+
+    if (!isPrivate) {
+      return ctx.reply(
+        '🎬 **Cine is ready in this group.**\n\n'
+        + '`/request <title>` — search movies and series\n'
+        + '`/cancel` — cancel the current action',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const baseMessage =
       '👋 Welcome to **Cine**!\n\n'
       + '`/request <title>` — search movies and series\n'
+      + '`/cancel` — cancel the current action';
+
+    if (!isOwner) {
+      return ctx.reply(baseMessage, { parse_mode: 'Markdown' });
+    }
+
+    ctx.reply(
+      `${baseMessage}\n`
       + '`/myid` — get your user ID\n'
-      + '`/source` — show current source channel info\n'
-      + '`/cancel` — cancel current operation',
+      + '`/source` — show saved source chats\n'
+      + '`/join <id/link>` — add a source chat\n'
+      + '`/initscan` — run the backfill command locally',
       { parse_mode: 'Markdown' }
     );
   });
 
   bot.command('myid', (ctx) => {
     ctx.reply(`Your user ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
+  });
+
+  bot.command('initscan', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    if (!process.env.API_ID || !process.env.API_HASH || !process.env.SESSION_STRING) {
+      return ctx.reply(
+        '❌ `API_ID`, `API_HASH`, or `SESSION_STRING` is not set in `.env`.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    if (initScanRunning) {
+      return ctx.reply('⏳ A backfill is already running.');
+    }
+
+    initScanRunning = true;
+    await ctx.reply('📥 Starting backfill for all saved source chats...', { parse_mode: 'Markdown' });
+
+    try {
+      const result = await initScan();
+      const summary = formatInitScanSummary(result);
+      await ctx.reply(
+        `✅ Backfill complete.\n\n${summary}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      await ctx.reply(`❌ Backfill failed: ${err.message}`, { parse_mode: 'Markdown' });
+    } finally {
+      initScanRunning = false;
+    }
   });
 
   // ── /join <chat_id> (owner-only, manual override) ──────
@@ -222,36 +278,9 @@ export async function startBot() {
     const item = db.prepare("SELECT * FROM media_index WHERE id = ?").get(id);
     if (!item) return ctx.answerCallbackQuery('Not found.');
 
-    const targetChatId = ctx.chat.id;
-    const isGroup = targetChatId !== ctx.from.id;
-
     await ctx.editMessageText('⏳ Forwarding...');
     await ctx.answerCallbackQuery();
-
-    try {
-      const fileIds = [];
-      if (item.package_id && item.total_parts > 1) {
-        const parts = db.prepare(
-          "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
-        ).all(item.package_id);
-        for (const p of parts) {
-          const sent = await ctx.api.forwardMessage(targetChatId, p.source_chat_id, p.source_msg_id);
-          if (isGroup) fileIds.push(sent.message_id);
-        }
-        await ctx.editMessageText(`✅ Sent ${parts.length} parts.${isGroup ? '. Save video privately — auto-deletes in 30s.' : ''}`);
-      } else {
-        const sent = await ctx.api.forwardMessage(targetChatId, item.source_chat_id, item.source_msg_id);
-        if (isGroup) fileIds.push(sent.message_id);
-        await ctx.editMessageText(`✅ Sent!${isGroup ? ' Save video privately — auto-deletes in 30s.' : ''}`);
-      }
-      if (isGroup && fileIds.length) {
-        setTimeout(async () => {
-          for (const msgId of fileIds) try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
-        }, 30_000);
-      }
-    } catch (err) {
-      await ctx.editMessageText(`❌ Failed: ${err.message}`);
-    }
+    await forwardItems(ctx, [item]);
   });
 
   // ── Send all ───────────────────────────────────────────
@@ -278,43 +307,9 @@ export async function startBot() {
 
     if (items.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
 
-    const targetChatId = ctx.chat.id;
-    const isGroup = targetChatId !== ctx.from.id;
-
     await ctx.editMessageText(`📤 Forwarding ${items.length} files...`);
     await ctx.answerCallbackQuery();
-
-    let sent = 0; let failed = 0;
-    const fileIds = [];
-    for (const item of items) {
-      try {
-        if (item.package_id && item.total_parts > 1) {
-          const parts = db.prepare(
-            "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
-          ).all(item.package_id);
-          for (const p of parts) {
-            const m = await ctx.api.forwardMessage(targetChatId, p.source_chat_id, p.source_msg_id);
-            if (isGroup) fileIds.push(m.message_id);
-            await new Promise(r => setTimeout(r, 200));
-          }
-        } else {
-          const m = await ctx.api.forwardMessage(targetChatId, item.source_chat_id, item.source_msg_id);
-          if (isGroup) fileIds.push(m.message_id);
-        }
-        sent++;
-      } catch (e) {
-        failed++;
-      }
-      if (sent % 5 === 0) await new Promise(r => setTimeout(r, 1000));
-    }
-
-    const errPart = failed > 0 ? ` (${failed} failed)` : '';
-    await ctx.editMessageText(`✅ Forwarded ${sent}/${items.length} files${errPart}${isGroup ? '. Save video privately — auto-deletes in 30s.' : ''}`);
-    if (isGroup && fileIds.length) {
-      setTimeout(async () => {
-        for (const msgId of fileIds) try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
-      }, 30_000);
-    }
+    await forwardItems(ctx, items);
   });
 
   // ── Send all by quality ────────────────────────────────
@@ -335,42 +330,9 @@ export async function startBot() {
     const items = db.prepare(query).all(...params);
     if (items.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
 
-    const targetChatId = ctx.chat.id;
-    const isGroup = targetChatId !== ctx.from.id;
-
     await ctx.editMessageText(`📤 Forwarding ${items.length} files...`);
     await ctx.answerCallbackQuery();
-
-    let sent = 0; let failed = 0;
-    const fileIds = [];
-    for (const item of items) {
-      try {
-        if (item.package_id && item.total_parts > 1) {
-          const parts = db.prepare(
-            "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
-          ).all(item.package_id);
-          for (const p of parts) {
-            const m = await ctx.api.forwardMessage(targetChatId, p.source_chat_id, p.source_msg_id);
-            if (isGroup) fileIds.push(m.message_id);
-            await new Promise(r => setTimeout(r, 200));
-          }
-        } else {
-          const m = await ctx.api.forwardMessage(targetChatId, item.source_chat_id, item.source_msg_id);
-          if (isGroup) fileIds.push(m.message_id);
-        }
-        sent++;
-      } catch (e) {
-        failed++;
-      }
-      if (sent % 5 === 0) await new Promise(r => setTimeout(r, 1000));
-    }
-    const errPart = failed > 0 ? ` (${failed} failed)` : '';
-    await ctx.editMessageText(`✅ Forwarded ${sent}/${items.length} files${errPart}${isGroup ? '. Save video privately — auto-deletes in 30s.' : ''}`);
-    if (isGroup && fileIds.length) {
-      setTimeout(async () => {
-        for (const msgId of fileIds) try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
-      }, 30_000);
-    }
+    await forwardItems(ctx, items);
   });
 
   // ── Navigation ─────────────────────────────────────────
@@ -583,6 +545,72 @@ async function showVersions(ctx, id, items) {
   });
 }
 
+async function forwardItems(ctx, items) {
+  const db = getDb();
+  const targetChatId = ctx.chat.id;
+  const isGroup = targetChatId !== ctx.from.id;
+
+  let sent = 0;
+  let failed = 0;
+  const fileIds = [];
+
+  for (const item of items) {
+    try {
+      if (item.package_id && item.total_parts > 1) {
+        const parts = db.prepare(
+          "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
+        ).all(item.package_id);
+        for (const p of parts) {
+          const m = await ctx.api.forwardMessage(targetChatId, p.source_chat_id, p.source_msg_id);
+          if (isGroup) fileIds.push(m.message_id);
+          await delay(200);
+        }
+      } else {
+        const m = await ctx.api.forwardMessage(targetChatId, item.source_chat_id, item.source_msg_id);
+        if (isGroup) fileIds.push(m.message_id);
+      }
+      sent++;
+    } catch {
+      failed++;
+    }
+
+    if (sent % 5 === 0) await delay(1000);
+  }
+
+  const errPart = failed > 0 ? ` (${failed} failed)` : '';
+  await ctx.editMessageText(
+    `✅ Forwarded ${sent}/${items.length} files${errPart}${isGroup ? '. Save video privately — auto-deletes in 30s.' : ''}`
+  );
+
+  if (isGroup && fileIds.length) {
+    setTimeout(async () => {
+      for (const msgId of fileIds) {
+        try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
+      }
+    }, 30_000);
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatInitScanSummary(result) {
+  const lines = [`Scanned: ${result.groupsScanned} source chat(s)`];
+
+  if (result.totalIndexed > 0) {
+    lines.push(`Indexed: ${result.totalIndexed}`);
+  } else {
+    lines.push('Indexed: 0 (no new files found)');
+  }
+
+  if (result.totalSkippedDuplicates > 0) {
+    lines.push(`Duplicates skipped: ${result.totalSkippedDuplicates}`);
+  }
+
+  return lines.join('\n');
+}
+
 function formatSize(bytes) {
   if (!bytes) return '';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -723,6 +751,7 @@ async function registerBotCommands(bot) {
       { command: 'source', description: 'Show saved source chats' },
       { command: 'myid', description: 'Show your Telegram user ID' },
       { command: 'join', description: 'Add a source chat by ID or link' },
+      { command: 'initscan', description: 'Show the local backfill command' },
     ],
     {
       scope: {
