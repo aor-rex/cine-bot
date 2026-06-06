@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "login": "node src/login.js",
-    "test": "node src/test.js"
+    "login": "node src/login.js"
   },
   "dependencies": {
     "grammy": "^1.42.0",

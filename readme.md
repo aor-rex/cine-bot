@@ -237,20 +237,43 @@ common options:
 - a cloud vm
 - a systemd service on linux
 
-### simple deployment
+### deployment command
 
-1. clone the repo
-2. install dependencies
-3. create `.env`
-4. start the bot:
+start the bot with:
 
 ```bash
 node src/index.js bot
 ```
 
+or:
+
+```bash
+npm run start -- bot
+```
+
+### production notes
+
+for production, make sure:
+
+- `.env` is present on the server
+- the bot is started with a process manager or system service
+- the `data/` folder is stored on persistent storage
+
+this matters because the sqlite database is stored at:
+
+```text
+data/cine.db
+```
+
+if `data/` is not on persistent storage, you can lose:
+
+- indexed files
+- source chat records
+- search data
+
 ### recommended production setup
 
-use a process manager or system service so the bot restarts automatically.
+use a process manager or system service so the bot restarts automatically after reboot or failure.
 
 examples:
 
@@ -260,13 +283,13 @@ examples:
 
 ### example systemd approach
 
-run the bot with:
+run this command from the project directory:
 
 ```bash
 node src/index.js bot
 ```
 
-set the working directory to the project folder and make sure `.env` is present there.
+set the working directory to the project folder, make sure `.env` is present there, and keep the `data/` directory on persistent storage.
 
 ## database
 
