@@ -5,6 +5,7 @@ import { initScan } from '../init-scan.js';
 
 let bot;
 let initScanRunning = false;
+const EPISODES_PER_PAGE = 10;
 
 export async function startBot() {
   const db = getDb();
@@ -151,7 +152,25 @@ export async function startBot() {
     `).all(query);
 
     if (results.length === 0) {
-      return ctx.reply('❌ No results found. Try a different title.');
+      const suggestions = findCloseMatches(db, query);
+      if (suggestions.length === 0) {
+        return ctx.reply(
+          `❌ No matches for "${query}".\n\nTry the full title, fewer words, or a release year.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+      const keyboard = new InlineKeyboard();
+      for (const suggestion of suggestions) {
+        const label = suggestion.year ? `${suggestion.title} (${suggestion.year})` : suggestion.title;
+        keyboard.text(label, `sel_${suggestion.id}`).row();
+      }
+      keyboard.text('❌ Cancel', 'cancel');
+
+      return ctx.reply(
+        `🔎 No exact matches for "${query}".\n\nDid you mean one of these?`,
+        { reply_markup: keyboard, parse_mode: 'Markdown' }
+      );
     }
 
     const groups = new Map();
@@ -195,7 +214,7 @@ export async function startBot() {
       const keyboard = new InlineKeyboard();
       for (const s of seasons) {
         const eps = items.filter(i => i.season === s);
-        keyboard.text(`Season ${s} (${eps.length} eps)`, `season_${s}_${first.id}`).row();
+        keyboard.text(`Season ${s} (${eps.length} eps)`, `season_${s}_${first.id}_0`).row();
       }
       keyboard.text('📦 Send All Seasons', `sendall_${first.id}`).row();
       keyboard.text('◀ Back', 'back').text('❌ Cancel', 'cancel');
@@ -209,9 +228,10 @@ export async function startBot() {
   });
 
   // ── Season selected ────────────────────────────────────
-  bot.callbackQuery(/^season_(\d+)_(\d+)$/, async (ctx) => {
+  bot.callbackQuery(/^season_(\d+)_(\d+)(?:_(\d+))?$/, async (ctx) => {
     const season = Number(ctx.match[1]);
     const id = Number(ctx.match[2]);
+    const page = ctx.match[3] ? Number(ctx.match[3]) : 0;
     const db = getDb();
     const items = db.prepare(`
       SELECT * FROM media_index
@@ -222,35 +242,7 @@ export async function startBot() {
 
     if (items.length === 0) return ctx.answerCallbackQuery('No episodes found.');
 
-    const first = items[0];
-    const eps = [...new Set(items.map(i => i.episode).filter(e => e != null))].sort();
-    const keyboard = new InlineKeyboard();
-    for (const e of eps) {
-      const versions = items.filter(i => i.episode === e);
-      const label = `E${String(e).padStart(2, '0')}`;
-      keyboard.text(
-        versions.length > 1 ? `${label} (${versions.length})` : label,
-        `ep_${e}_${first.id}`
-      ).row();
-    }
-    // Quality-grouped Send All buttons
-    const qualityGroups = db.prepare(`
-      SELECT DISTINCT resolution, codec FROM media_index
-      WHERE title = (SELECT title FROM media_index WHERE id = ?)
-        AND season = ?
-    `).all(first.id, season);
-
-    for (const q of qualityGroups) {
-      const label = ['📦 All', q.resolution, q.codec].filter(Boolean).join(' ').toUpperCase();
-      const res = q.resolution || '-';
-      const codec = q.codec || '-';
-      keyboard.text(label, `sendallq:${first.id}:${season}:${res}:${codec}`).row();
-    }
-
-    keyboard.text('◀ Seasons', `titleback_${first.id}`).text('❌ Cancel', 'cancel');
-    await ctx.editMessageText(`**${first.title} S${String(season).padStart(2, '0')}** — select episode:`, {
-      reply_markup: keyboard, parse_mode: 'Markdown',
-    });
+    await renderSeasonEpisodePage(ctx, items, season, page);
     await ctx.answerCallbackQuery();
   });
 
@@ -350,7 +342,7 @@ export async function startBot() {
     const keyboard = new InlineKeyboard();
     for (const s of seasons) {
       const eps = items.filter(i => i.season === s);
-      keyboard.text(`Season ${s} (${eps.length} eps)`, `season_${s}_${id}`).row();
+      keyboard.text(`Season ${s} (${eps.length} eps)`, `season_${s}_${id}_0`).row();
     }
     keyboard.text('📦 Send All Seasons', `sendall_${id}`).row();
     keyboard.text('❌ Cancel', 'cancel');
@@ -367,6 +359,10 @@ export async function startBot() {
 
   bot.callbackQuery('cancel', async (ctx) => {
     await ctx.editMessageText('❌ Cancelled.');
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('noop', async (ctx) => {
     await ctx.answerCallbackQuery();
   });
 
@@ -545,6 +541,50 @@ async function showVersions(ctx, id, items) {
   });
 }
 
+async function renderSeasonEpisodePage(ctx, items, season, page) {
+  const first = items[0];
+  const eps = [...new Set(items.map((i) => i.episode).filter((e) => e != null))].sort((a, b) => a - b);
+  const totalPages = Math.max(1, Math.ceil(eps.length / EPISODES_PER_PAGE));
+  const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
+  const start = currentPage * EPISODES_PER_PAGE;
+  const pageEpisodes = eps.slice(start, start + EPISODES_PER_PAGE);
+  const keyboard = new InlineKeyboard();
+
+  for (const e of pageEpisodes) {
+    const versions = items.filter((i) => i.episode === e);
+    const label = `E${String(e).padStart(2, '0')}`;
+    keyboard.text(
+      versions.length > 1 ? `${label} (${versions.length})` : label,
+      `ep_${e}_${first.id}`
+    ).row();
+  }
+
+  if (totalPages > 1) {
+    if (currentPage > 0) {
+      keyboard.text('◀ Prev', `season_${season}_${first.id}_${currentPage - 1}`);
+    }
+    keyboard.text(`Page ${currentPage + 1}/${totalPages}`, 'noop');
+    if (currentPage < totalPages - 1) {
+      keyboard.text('Next ▶', `season_${season}_${first.id}_${currentPage + 1}`);
+    }
+    keyboard.row();
+  }
+
+  const qualityGroups = getSeasonQualityGroups(first.id, season);
+  for (const q of qualityGroups) {
+    const label = ['📦 All', q.resolution, q.codec].filter(Boolean).join(' ').toUpperCase();
+    const res = q.resolution || '-';
+    const codec = q.codec || '-';
+    keyboard.text(label, `sendallq:${first.id}:${season}:${res}:${codec}`).row();
+  }
+
+  keyboard.text('◀ Seasons', `titleback_${first.id}`).text('❌ Cancel', 'cancel');
+  await ctx.editMessageText(
+    `**${first.title} S${String(season).padStart(2, '0')}** — choose an episode${totalPages > 1 ? ` (page ${currentPage + 1}/${totalPages})` : ''}:`,
+    { reply_markup: keyboard, parse_mode: 'Markdown' }
+  );
+}
+
 async function forwardItems(ctx, items) {
   const db = getDb();
   const targetChatId = ctx.chat.id;
@@ -593,6 +633,15 @@ async function forwardItems(ctx, items) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getSeasonQualityGroups(id, season) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT DISTINCT resolution, codec FROM media_index
+    WHERE title = (SELECT title FROM media_index WHERE id = ?)
+      AND season = ?
+  `).all(id, season);
 }
 
 function formatInitScanSummary(result) {
@@ -711,6 +760,67 @@ function normalizeDbValue(value) {
   if (Buffer.isBuffer(value)) return value;
   if (Array.isArray(value)) return value.join(', ');
   return String(value);
+}
+
+function findCloseMatches(db, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  const candidates = db.prepare(`
+    SELECT MIN(id) AS id, title, year
+    FROM media_index
+    GROUP BY title, year
+  `).all();
+
+  return candidates
+    .map((candidate) => ({
+      ...candidate,
+      score: scoreTitleMatch(normalizedQuery, normalizeSearchText(candidate.title)),
+    }))
+    .filter((candidate) => candidate.score > 0.35)
+    .sort((a, b) => b.score - a.score || String(a.title).localeCompare(String(b.title)))
+    .slice(0, 5);
+}
+
+function scoreTitleMatch(query, title) {
+  if (!query || !title) return 0;
+  if (title.includes(query) || query.includes(title)) return 0.95;
+
+  const queryTokens = new Set(query.split(' ').filter(Boolean));
+  const titleTokens = new Set(title.split(' ').filter(Boolean));
+  const overlap = [...queryTokens].filter((token) => titleTokens.has(token)).length;
+  const tokenScore = overlap / Math.max(queryTokens.size, titleTokens.size, 1);
+
+  const editScore = 1 - levenshteinDistance(query, title) / Math.max(query.length, title.length, 1);
+  return Math.max(tokenScore * 0.8 + editScore * 0.2, editScore * 0.75);
+}
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function levenshteinDistance(a, b) {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+  for (let i = 0; i < rows; i++) dp[i][0] = i;
+  for (let j = 0; j < cols; j++) dp[0][j] = j;
+
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+
+  return dp[a.length][b.length];
 }
 
 function normalizeChatRef(input) {
