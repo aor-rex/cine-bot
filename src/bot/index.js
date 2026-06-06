@@ -65,7 +65,9 @@ export async function startBot() {
       + '`/cancel` — cancel the current action';
 
     if (!isOwner) {
-      return ctx.reply(baseMessage, { parse_mode: 'Markdown' });
+      return ensureDmAccess(ctx, async () => {
+        await ctx.reply(baseMessage, { parse_mode: 'Markdown' });
+      });
     }
 
     ctx.reply(
@@ -73,6 +75,9 @@ export async function startBot() {
       + '`/myid` — get your user ID\n'
       + '`/source` — show saved source chats\n'
       + '`/join <id/link>` — add a source chat\n'
+      + '`/required` — show required channel gate\n'
+      + '`/setrequired <id> <link>` — set required channel gate\n'
+      + '`/clearrequired` — clear required channel gate\n'
       + '`/initscan` — run the backfill command locally',
       { parse_mode: 'Markdown' }
     );
@@ -115,6 +120,52 @@ export async function startBot() {
     }
   });
 
+  bot.command('required', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const setting = getRequiredChannelSetting(getDb());
+    if (!setting.id && !setting.link) {
+      return ctx.reply('No required channel is configured.');
+    }
+
+    await ctx.reply(
+      `Required channel:\n`
+      + `ID: \`${setting.id || 'not set'}\`\n`
+      + `Link: ${setting.link || 'not set'}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.command('setrequired', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const input = ctx.match?.trim() || '';
+    const [rawId, rawLink] = input.split(/\s+/, 2);
+    const channelId = Number(rawId);
+    if (!channelId || !rawLink) {
+      return ctx.reply(
+        'Usage:\n`/setrequired -1001234567890 https://t.me/channelusername`',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    saveRequiredChannelSetting(getDb(), channelId, rawLink);
+    await ctx.reply('✅ Required channel updated.', { parse_mode: 'Markdown' });
+  });
+
+  bot.command('clearrequired', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    clearRequiredChannelSetting(getDb());
+    await ctx.reply('✅ Required channel cleared.', { parse_mode: 'Markdown' });
+  });
+
   // ── /join <chat_id> (owner-only, manual override) ──────
   bot.command('join', async (ctx) => {
     if (ctx.from.id !== config.ownerUserId) {
@@ -149,6 +200,9 @@ export async function startBot() {
 
   // ── /request ────────────────────────────────────────────
   bot.command('request', async (ctx) => {
+    const accessBlocked = await ensureDmAccess(ctx);
+    if (accessBlocked) return;
+
     const query = ctx.match?.trim();
     if (!query) {
       return ctx.reply('Usage: `/request <movie or series title>`', { parse_mode: 'Markdown' });
@@ -383,6 +437,22 @@ export async function startBot() {
 
   bot.callbackQuery('noop', async (ctx) => {
     await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('checkjoin', async (ctx) => {
+    const allowed = await hasRequiredChannelAccess(ctx);
+    if (allowed) {
+      await ctx.answerCallbackQuery('access granted');
+      try {
+        await ctx.editMessageText(
+          '✅ Access confirmed.\n\nUse `/request <title>` to search for movies and series.',
+          { parse_mode: 'Markdown' }
+        );
+      } catch {}
+      return;
+    }
+
+    await ctx.answerCallbackQuery('join the channel first');
   });
 
   // ── Auto-detect: bot added to channel or group ────────
@@ -664,6 +734,75 @@ function getAutoDeleteDelayMs() {
 
 function formatAutoDeleteMinutes(ms) {
   return (ms / 60_000).toFixed(1);
+}
+
+async function ensureDmAccess(ctx, onAllowed) {
+  if (ctx.chat?.type !== 'private' || ctx.from?.id === config.ownerUserId) {
+    if (onAllowed) await onAllowed();
+    return false;
+  }
+
+  const allowed = await hasRequiredChannelAccess(ctx);
+  if (allowed) {
+    if (onAllowed) await onAllowed();
+    return false;
+  }
+
+  await sendRequiredChannelPrompt(ctx);
+  return true;
+}
+
+async function hasRequiredChannelAccess(ctx) {
+  const setting = getRequiredChannelSetting(getDb());
+  if (!setting.id) return true;
+
+  try {
+    const member = await ctx.api.getChatMember(setting.id, ctx.from.id);
+    return !['left', 'kicked'].includes(member.status);
+  } catch {
+    return false;
+  }
+}
+
+async function sendRequiredChannelPrompt(ctx) {
+  const setting = getRequiredChannelSetting(getDb());
+  const keyboard = new InlineKeyboard();
+  if (setting.link) keyboard.url('join channel', setting.link);
+  keyboard.text('check again', 'checkjoin');
+
+  await ctx.reply(
+    'you need to join the required channel before using cine in dm.',
+    { reply_markup: keyboard }
+  );
+}
+
+function getRequiredChannelSetting(db) {
+  const idRow = db.prepare("SELECT value FROM bot_settings WHERE key = 'required_channel_id'").get();
+  const linkRow = db.prepare("SELECT value FROM bot_settings WHERE key = 'required_channel_link'").get();
+
+  return {
+    id: Number(idRow?.value || config.requiredChannelId || 0),
+    link: linkRow?.value || config.requiredChannelLink || '',
+  };
+}
+
+function saveRequiredChannelSetting(db, channelId, link) {
+  const stmt = db.prepare(`
+    INSERT INTO bot_settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+
+  db.transaction(() => {
+    stmt.run('required_channel_id', String(channelId));
+    stmt.run('required_channel_link', link);
+  })();
+}
+
+function clearRequiredChannelSetting(db) {
+  db.prepare(
+    "DELETE FROM bot_settings WHERE key IN ('required_channel_id', 'required_channel_link')"
+  ).run();
 }
 
 function trackInteractiveMessage(chatId, messageId, userId) {
@@ -969,6 +1108,9 @@ async function registerBotCommands(bot) {
       { command: 'source', description: 'Show saved source chats' },
       { command: 'myid', description: 'Show your Telegram user ID' },
       { command: 'join', description: 'Add a source chat by ID or link' },
+      { command: 'required', description: 'Show the required channel gate' },
+      { command: 'setrequired', description: 'Set required channel ID and link' },
+      { command: 'clearrequired', description: 'Clear the required channel gate' },
       { command: 'initscan', description: 'Show the local backfill command' },
     ],
     {

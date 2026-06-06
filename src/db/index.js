@@ -86,6 +86,11 @@ function initSchema(db) {
       type TEXT DEFAULT 'channel',
       joined_at TEXT DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS bot_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
   `);
 
   // Migration: add type column if missing (existing DBs)
