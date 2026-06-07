@@ -13,6 +13,7 @@ it indexes files from telegram channels and groups, stores them in sqlite, and l
 - live indexing for newly posted files
 - historical backfill for old files with `gramjs`
 - owner-only source management and backfill trigger
+- optional required-channel join gate for dm access
 - telegram command menu for users and owner/admin dm
 
 ## how it works
@@ -48,6 +49,8 @@ create a `.env` file:
 ```env
 BOT_TOKEN=your_bot_token
 OWNER_USER_ID=your_telegram_user_id
+REQUIRED_CHANNEL_ID=
+REQUIRED_CHANNEL_LINK=
 
 # only needed for old-file backfill
 API_ID=
@@ -115,12 +118,47 @@ then confirm saved sources with:
 - `/request <title>` - search for a movie or series
 - `/cancel` - cancel the current action
 
+if a required channel is configured, users must join it before they can use the bot in dm.
+
 ### for the owner
 
 - `/myid` - show your Telegram user id
 - `/source` - list saved source chats
 - `/join <id/link>` - add a source chat manually
+- `/required` - show the required channel gate
+- `/setrequired <id> <link>` - set the required channel gate
+- `/clearrequired` - clear the required channel gate
 - `/initscan` - run historical backfill from owner DM
+
+## required channel gate
+
+you can require users to join a specific channel before they can use the bot in dm.
+
+this gate:
+
+- applies to regular users in dm
+- does not block the owner
+- does not affect group usage
+- shows a `join channel` button and a `check again` button
+
+you can configure it in 2 ways:
+
+### option 1. from `.env`
+
+```env
+REQUIRED_CHANNEL_ID=-1001234567890
+REQUIRED_CHANNEL_LINK=https://t.me/yourchannel
+```
+
+### option 2. from owner dm
+
+```text
+/setrequired -1001234567890 https://t.me/yourchannel
+/required
+/clearrequired
+```
+
+the bot should also be able to check membership in that channel, so make sure it has access there.
 
 ## request flow
 
@@ -309,6 +347,7 @@ this includes:
 
 - for channels, the bot should usually be an admin to receive posts reliably
 - for groups/supergroups, the bot must be in the chat to index new files
+- if you use the required-channel gate, the bot must be able to check membership in that channel
 - old-file backfill needs your telegram user session, not just the bot token
 - the bot supports multiple source chats
 - duplicate files across sources are skipped during indexing
