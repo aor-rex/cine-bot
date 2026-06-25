@@ -91,10 +91,20 @@ function initSchema(db) {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS bot_chats (
+      chat_id INTEGER PRIMARY KEY,
+      title TEXT,
+      type TEXT,
+      added_at TEXT DEFAULT (datetime('now'))
+    );
   `);
 
   // Migration: add type column if missing (existing DBs)
   try { db.exec("ALTER TABLE source_groups ADD COLUMN type TEXT DEFAULT 'channel'"); } catch {}
+
+  // Migration: add backup_msg_id column if missing (existing DBs)
+  try { db.exec("ALTER TABLE media_index ADD COLUMN backup_msg_id INTEGER"); } catch {}
 }
 
 export function closeDb() {

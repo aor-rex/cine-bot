@@ -11,6 +11,8 @@ const REQUEST_UI_TTL_MS = 3 * 60 * 1000;
 const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
 const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
 const interactiveMessages = new Map();
+let dumpRunning = false;
+let dumpScheduleTimeout = null;
 
 export async function startBot() {
   const db = getDb();
@@ -19,6 +21,8 @@ export async function startBot() {
   if (sources.length > 0) {
     console.log(`Source chats restored: ${sources.map((source) => source.title || source.chat_id).join(', ')}`);
   }
+
+  scheduleNextDump();
 
   bot = new Bot(config.botToken);
 
@@ -459,10 +463,15 @@ export async function startBot() {
   bot.on('my_chat_member', async (ctx) => {
     const status = ctx.myChatMember.new_chat_member.status;
     const chat = ctx.myChatMember.chat;
+    const db = getDb();
+
+    // Track every chat the bot joins
+    if (['member', 'administrator'].includes(status)) {
+      trackBotChat(db, chat);
+    }
 
     // Channel: bot must be admin, save as source
     if (chat.type === 'channel' && status === 'administrator') {
-      const db = getDb();
       saveSourceGroup(db, chat);
       console.log(`Source channel auto-detected: ${chat.title} (${chat.id})`);
       try { await ctx.api.sendMessage(chat.id, '✅ Cine will index files from this channel.'); } catch {}
@@ -482,9 +491,9 @@ export async function startBot() {
 
     // Removed: clean up if this was the source channel
     if (status === 'left' || status === 'kicked') {
-      const db = getDb();
+      untrackBotChat(db, chat.id);
       removeSourceGroup(db, chat.id);
-      console.log(`Source chat removed: ${chat.id}`);
+      console.log(`Bot removed from chat: ${chat.id}`);
     }
   });
 
@@ -514,6 +523,136 @@ export async function startBot() {
   // ── /cancel ─────────────────────────────────────────
   bot.command('cancel', async (ctx) => {
     ctx.reply('OK.');
+  });
+
+  // ── /channels (owner-only) ──────────────────────────────
+  bot.command('channels', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const db = getDb();
+    const chats = getBotChats(db);
+    if (chats.length === 0) {
+      return ctx.reply('Not tracking any chats yet. Add me to a channel or group.');
+    }
+
+    const lines = chats.map((c, i) =>
+      `${i + 1}. ${c.title || 'Untitled'}\n   ID: \`${c.chat_id}\`\n   Type: ${c.type}\n   Since: ${c.added_at || 'Unknown'}`
+    );
+    ctx.reply(
+      `📋 **Bot Chats**\n\n${lines.join('\n\n')}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // ── /setbackup (owner-only) ─────────────────────────────
+  bot.command('setbackup', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const input = ctx.match?.trim();
+    const chatRef = normalizeChatRef(input);
+    if (!chatRef) {
+      return ctx.reply(
+        'Usage:\n'
+        + '`/setbackup -1001234567890`\n'
+        + '`/setbackup @channelusername`\n'
+        + '`/setbackup https://t.me/channelusername`',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    try {
+      const chat = await ctx.api.getChat(chatRef);
+      const db = getDb();
+      saveBackupChannelSetting(db, chat.id);
+      ctx.reply(
+        `✅ Backup channel set to: ${chat.title || chat.id} (${chat.type})\n\n`
+        + 'Now run `/dump` to start backing up files.',
+        { parse_mode: 'Markdown' }
+      );
+    } catch (err) {
+      ctx.reply(`❌ Failed: ${err.message}`);
+    }
+  });
+
+  // ── /dump (owner-only) ─────────────────────────────────
+  bot.command('dump', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const db = getDb();
+    const backupChannelId = getBackupChannelSetting(db);
+    if (!backupChannelId) {
+      return ctx.reply(
+        '❌ No backup channel set.\n\n'
+        + 'Use `/setbackup <id/link>` first.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    // Parse interval if provided
+    const intervalInput = ctx.match?.trim();
+    if (intervalInput && ['off', 'stop', 'none', 'clear'].includes(intervalInput.toLowerCase())) {
+      clearDumpSchedule();
+      db.prepare("DELETE FROM bot_settings WHERE key = 'dump_interval'").run();
+      return ctx.reply('⏹ Scheduled dump cancelled.', { parse_mode: 'Markdown' });
+    }
+
+    let intervalMs = 0;
+    if (intervalInput) {
+      intervalMs = parseDumpInterval(intervalInput);
+      if (!intervalMs) {
+        return ctx.reply(
+          '❌ Invalid interval. Examples: `1w`, `7d`, `3h`, `30m`, `1 week`, `off`',
+          { parse_mode: 'Markdown' }
+        );
+      }
+      db.prepare(
+        "INSERT INTO bot_settings (key, value) VALUES ('dump_interval', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).run(String(intervalMs));
+    }
+
+    if (dumpRunning) {
+      return ctx.reply('⏳ A dump is already running.', { parse_mode: 'Markdown' });
+    }
+
+    dumpRunning = true;
+    const statusMsg = await ctx.reply('📤 Starting backup...', { parse_mode: 'Markdown' });
+
+    try {
+      const result = await runBackup(ctx, statusMsg, backupChannelId);
+      const summary = formatDumpSummary(result);
+
+      await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+        `✅ Dump complete.\n\n${summary}`,
+        { parse_mode: 'Markdown' }
+      );
+
+      // Update last_dump_at and schedule next
+      db.prepare(
+        "INSERT INTO bot_settings (key, value) VALUES ('last_dump_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).run(new Date().toISOString());
+
+      if (intervalMs > 0) {
+        scheduleDumpAfter(intervalMs);
+        const label = formatIntervalLabel(intervalMs);
+        await bot.api.sendMessage(config.ownerUserId,
+          `⏰ Next dump scheduled in ${label}.`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (err) {
+      await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+        `❌ Dump failed: ${err.message}`,
+        { parse_mode: 'Markdown' }
+      );
+    } finally {
+      dumpRunning = false;
+    }
   });
 
   // ── Index helper ────────────────────────────────────────
@@ -1112,6 +1251,9 @@ async function registerBotCommands(bot) {
       { command: 'setrequired', description: 'Set required channel ID and link' },
       { command: 'clearrequired', description: 'Clear the required channel gate' },
       { command: 'initscan', description: 'Show the local backfill command' },
+      { command: 'channels', description: 'List all chats the bot is in' },
+      { command: 'setbackup', description: 'Set backup channel by ID or link' },
+      { command: 'dump', description: 'Backup files or set schedule (e.g. /dump 1w)' },
     ],
     {
       scope: {
@@ -1148,4 +1290,227 @@ function saveSourceGroup(db, chat) {
 
 function removeSourceGroup(db, chatId) {
   db.prepare("DELETE FROM source_groups WHERE chat_id = ?").run(chatId);
+}
+
+// ── Bot chat tracking ─────────────────────────────────────
+function trackBotChat(db, chat) {
+  db.prepare(`
+    INSERT OR REPLACE INTO bot_chats (chat_id, title, type, added_at)
+    VALUES (?, ?, ?, datetime('now'))
+  `).run(chat.id, chat.title || null, chat.type || 'unknown');
+}
+
+function untrackBotChat(db, chatId) {
+  db.prepare("DELETE FROM bot_chats WHERE chat_id = ?").run(chatId);
+}
+
+function getBotChats(db) {
+  return db.prepare("SELECT * FROM bot_chats ORDER BY added_at DESC").all();
+}
+
+// ── Backup channel settings ───────────────────────────────
+function getBackupChannelSetting(db) {
+  const row = db.prepare("SELECT value FROM bot_settings WHERE key = 'backup_channel_id'").get();
+  return row ? Number(row.value) : 0;
+}
+
+function saveBackupChannelSetting(db, chatId) {
+  db.prepare(`
+    INSERT INTO bot_settings (key, value)
+    VALUES ('backup_channel_id', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(String(chatId));
+}
+
+// ── Dump interval helpers ─────────────────────────────────
+function parseDumpInterval(input) {
+  if (!input) return 0;
+  const str = input.trim().toLowerCase();
+
+  const match = str.match(/^(\d+)\s*(w(?:eeks?)?|d(?:ays?)?|h(?:ours?)?|m(?:in(?:utes?)?)?)$/);
+  if (!match) return 0;
+
+  const num = Number(match[1]);
+  const unit = match[2][0];
+
+  const multipliers = { w: 7 * 24 * 60 * 60 * 1000, d: 24 * 60 * 60 * 1000, h: 60 * 60 * 1000, m: 60 * 1000 };
+  const ms = num * (multipliers[unit] || 0);
+
+  // Minimum 10 minutes
+  return Math.max(ms, 10 * 60 * 1000);
+}
+
+function formatIntervalLabel(ms) {
+  const units = [
+    { label: 'week', ms: 7 * 24 * 60 * 60 * 1000 },
+    { label: 'day', ms: 24 * 60 * 60 * 1000 },
+    { label: 'hour', ms: 60 * 60 * 1000 },
+    { label: 'min', ms: 60 * 1000 },
+  ];
+  for (const u of units) {
+    if (ms >= u.ms && ms % u.ms === 0) {
+      const val = ms / u.ms;
+      return `${val} ${u.label}${val > 1 ? 's' : ''}`;
+    }
+  }
+  return `${Math.round(ms / 60_000)} min`;
+}
+
+function clearDumpSchedule() {
+  if (dumpScheduleTimeout) {
+    clearTimeout(dumpScheduleTimeout);
+    dumpScheduleTimeout = null;
+  }
+}
+
+function scheduleDumpAfter(intervalMs) {
+  clearDumpSchedule();
+  dumpScheduleTimeout = setTimeout(async () => {
+    if (dumpRunning) return;
+
+    const db = getDb();
+    const backupChannelId = getBackupChannelSetting(db);
+    if (!backupChannelId) return;
+
+    // Re-read interval in case it changed
+    const row = db.prepare("SELECT value FROM bot_settings WHERE key = 'dump_interval'").get();
+    if (!row) return;
+    const storedInterval = Number(row.value);
+    if (!storedInterval) return;
+
+    dumpRunning = true;
+    try {
+      // Send status to owner
+      const statusMsg = await bot.api.sendMessage(config.ownerUserId, '📤 Running scheduled dump...');
+      const result = await runBackup({ api: bot.api, chat: { id: config.ownerUserId } }, statusMsg, backupChannelId);
+
+      await bot.api.editMessageText(config.ownerUserId, statusMsg.message_id,
+        `✅ Scheduled dump complete.\n\n${formatDumpSummary(result)}`,
+        { parse_mode: 'Markdown' }
+      );
+
+      db.prepare(
+        "INSERT INTO bot_settings (key, value) VALUES ('last_dump_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).run(new Date().toISOString());
+    } catch (err) {
+      try {
+        await bot.api.sendMessage(config.ownerUserId,
+          `❌ Scheduled dump failed: ${err.message}`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch {}
+    } finally {
+      dumpRunning = false;
+      scheduleDumpAfter(storedInterval);
+    }
+  }, intervalMs);
+}
+
+function scheduleNextDump() {
+  const db = getDb();
+  const row = db.prepare("SELECT value FROM bot_settings WHERE key = 'dump_interval'").get();
+  if (!row) return;
+
+  const intervalMs = Number(row.value);
+  if (!intervalMs) return;
+
+  const lastRow = db.prepare("SELECT value FROM bot_settings WHERE key = 'last_dump_at'").get();
+  const lastDumpAt = lastRow ? new Date(lastRow.value).getTime() : 0;
+  const now = Date.now();
+  const elapsed = now - lastDumpAt;
+
+  if (elapsed >= intervalMs || !lastDumpAt) {
+    // Overdue — run immediately
+    console.log('Scheduled dump is overdue. Running now...');
+    dumpRunning = true;
+    const backupChannelId = getBackupChannelSetting(db);
+    if (backupChannelId) {
+      (async () => {
+        try {
+          const statusMsg = await bot.api.sendMessage(config.ownerUserId, '📤 Starting scheduled dump (overdue)...');
+          const result = await runBackup({ api: bot.api, chat: { id: config.ownerUserId } }, statusMsg, backupChannelId);
+
+          await bot.api.editMessageText(config.ownerUserId, statusMsg.message_id,
+            `✅ Scheduled dump complete.\n\n${formatDumpSummary(result)}`,
+            { parse_mode: 'Markdown' }
+          );
+
+          db.prepare(
+            "INSERT INTO bot_settings (key, value) VALUES ('last_dump_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+          ).run(new Date().toISOString());
+        } catch (err) {
+          try {
+            await bot.api.sendMessage(config.ownerUserId,
+              `❌ Scheduled dump failed: ${err.message}`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch {}
+        } finally {
+          dumpRunning = false;
+          scheduleDumpAfter(intervalMs);
+        }
+      })();
+    } else {
+      dumpRunning = false;
+      scheduleDumpAfter(intervalMs);
+    }
+  } else {
+    // Schedule for remaining time
+    const remaining = intervalMs - elapsed;
+    console.log(`Next dump in ${formatIntervalLabel(remaining)}`);
+    scheduleDumpAfter(remaining);
+  }
+}
+
+// ── Backup execution ──────────────────────────────────────
+async function runBackup(ctx, statusMsg, backupChannelId) {
+  const db = getDb();
+  const items = db.prepare(`
+    SELECT * FROM media_index WHERE backup_msg_id IS NULL ORDER BY id
+  `).all();
+
+  if (items.length === 0) {
+    return { copied: 0, skipped: 0, failed: 0, total: 0 };
+  }
+
+  let copied = 0;
+  let failed = 0;
+  let total = items.length;
+
+  for (const item of items) {
+    // Skip if already backed up (might have been handled as part of a package)
+    const check = db.prepare("SELECT backup_msg_id FROM media_index WHERE id = ?").get(item.id);
+    if (check && check.backup_msg_id != null) continue;
+
+    try {
+      const m = await ctx.api.copyMessage(backupChannelId, item.source_chat_id, item.source_msg_id);
+      db.prepare("UPDATE media_index SET backup_msg_id = ? WHERE id = ?").run(m.message_id, item.id);
+      copied++;
+
+      if (copied % 5 === 0) {
+        await delay(1000);
+        try {
+          await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+            `📤 Backing up... ${copied}/${total} files`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch {}
+      }
+    } catch {
+      failed++;
+      db.prepare("UPDATE media_index SET backup_msg_id = -1 WHERE id = ?").run(item.id);
+    }
+  }
+
+  return { copied, failed, total };
+}
+
+function formatDumpSummary(result) {
+  const lines = [`Copied: ${result.copied}`];
+
+  const skipped = result.total - result.copied - result.failed;
+  if (skipped > 0) lines.push(`Skipped (already backed up): ${skipped}`);
+  if (result.failed > 0) lines.push(`Failed: ${result.failed}`);
+
+  return lines.join('\n');
 }
