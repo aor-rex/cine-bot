@@ -105,6 +105,9 @@ function initSchema(db) {
 
   // Migration: add backup_msg_id column if missing (existing DBs)
   try { db.exec("ALTER TABLE media_index ADD COLUMN backup_msg_id INTEGER"); } catch {}
+
+  // Migration: add backup_retries column if missing (existing DBs)
+  try { db.exec("ALTER TABLE media_index ADD COLUMN backup_retries INTEGER DEFAULT 0"); } catch {}
 }
 
 export function closeDb() {

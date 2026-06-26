@@ -655,6 +655,27 @@ export async function startBot() {
     }
   });
 
+  // ── /retrydump (owner-only) ─────────────────────────────
+  bot.command('retrydump', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+
+    const db = getDb();
+    const count = db.prepare("SELECT COUNT(*) AS c FROM media_index WHERE backup_msg_id = -1").get().c;
+
+    if (count === 0) {
+      return ctx.reply('No abandoned files to retry.', { parse_mode: 'Markdown' });
+    }
+
+    db.prepare("UPDATE media_index SET backup_msg_id = NULL, backup_retries = 0 WHERE backup_msg_id = -1").run();
+    ctx.reply(
+      `✅ Reset ${count} abandoned file(s).\n\n`
+      + 'Run `/dump` to retry them.',
+      { parse_mode: 'Markdown' }
+    );
+  });
+
   // ── Index helper ────────────────────────────────────────
   async function indexFile(chatId, msgId, file, filename) {
     const db = getDb();
@@ -1254,6 +1275,7 @@ async function registerBotCommands(bot) {
       { command: 'channels', description: 'List all chats the bot is in' },
       { command: 'setbackup', description: 'Set backup channel by ID or link' },
       { command: 'dump', description: 'Backup files or set schedule (e.g. /dump 1w)' },
+      { command: 'retrydump', description: 'Reset abandoned files for retry' },
     ],
     {
       scope: {
@@ -1365,6 +1387,7 @@ function clearDumpSchedule() {
 
 function scheduleDumpAfter(intervalMs) {
   clearDumpSchedule();
+  console.log(`[dump] next scheduled in ${formatIntervalLabel(intervalMs)}`);
   dumpScheduleTimeout = setTimeout(async () => {
     if (dumpRunning) return;
 
@@ -1420,8 +1443,11 @@ function scheduleNextDump() {
   const elapsed = now - lastDumpAt;
 
   if (elapsed >= intervalMs || !lastDumpAt) {
-    // Overdue — run immediately
-    console.log('Scheduled dump is overdue. Running now...');
+    if (!lastDumpAt) {
+      console.log('[dump] no previous dump found — running now');
+    } else {
+      console.log(`[dump] overdue by ${formatIntervalLabel(elapsed)} — running now`);
+    }
     dumpRunning = true;
     const backupChannelId = getBackupChannelSetting(db);
     if (backupChannelId) {
@@ -1470,47 +1496,63 @@ async function runBackup(ctx, statusMsg, backupChannelId) {
   `).all();
 
   if (items.length === 0) {
-    return { copied: 0, skipped: 0, failed: 0, total: 0 };
+    console.log('[dump] no files to back up');
+    return { copied: 0, failedRetry: 0, failedPermanent: 0, total: 0 };
   }
 
   let copied = 0;
-  let failed = 0;
+  let failedRetry = 0;
+  let failedPermanent = 0;
   let total = items.length;
 
   for (const item of items) {
-    // Skip if already backed up (might have been handled as part of a package)
-    const check = db.prepare("SELECT backup_msg_id FROM media_index WHERE id = ?").get(item.id);
+    const check = db.prepare("SELECT backup_msg_id, backup_retries FROM media_index WHERE id = ?").get(item.id);
     if (check && check.backup_msg_id != null) continue;
 
     try {
       const m = await ctx.api.copyMessage(backupChannelId, item.source_chat_id, item.source_msg_id);
-      db.prepare("UPDATE media_index SET backup_msg_id = ? WHERE id = ?").run(m.message_id, item.id);
+      db.prepare("UPDATE media_index SET backup_msg_id = ?, backup_retries = 0 WHERE id = ?").run(m.message_id, item.id);
       copied++;
-
-      if (copied % 5 === 0) {
-        await delay(1000);
-        try {
-          await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
-            `📤 Backing up... ${copied}/${total} files`,
-            { parse_mode: 'Markdown' }
-          );
-        } catch {}
+    } catch (err) {
+      const retries = (check?.backup_retries || 0) + 1;
+      if (retries >= 3) {
+        db.prepare("UPDATE media_index SET backup_msg_id = -1, backup_retries = ? WHERE id = ?").run(retries, item.id);
+        failedPermanent++;
+        console.log(`[dump] ABANDONED id=${item.id} title="${item.title}" source=(${item.source_chat_id}, ${item.source_msg_id}) attempt=${retries}/3 ${err.message}`);
+      } else {
+        db.prepare("UPDATE media_index SET backup_retries = ? WHERE id = ?").run(retries, item.id);
+        failedRetry++;
+        console.log(`[dump] FAILED id=${item.id} title="${item.title}" source=(${item.source_chat_id}, ${item.source_msg_id}) attempt=${retries}/3 ${err.message}`);
       }
-    } catch {
-      failed++;
-      db.prepare("UPDATE media_index SET backup_msg_id = -1 WHERE id = ?").run(item.id);
+    }
+
+    const done = copied + failedRetry + failedPermanent;
+    if (done % 100 === 0 && done > 0) {
+      console.log(`[dump] progress: ${copied}/${total} copied, ${failedRetry} retrying, ${failedPermanent} abandoned`);
+    }
+
+    if (done % 5 === 0) {
+      await delay(1000);
+      try {
+        await bot.api.editMessageText(ctx.chat.id, statusMsg.message_id,
+          `📤 Backing up... ${done}/${total} files`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch {}
     }
   }
 
-  return { copied, failed, total };
+  console.log(`[dump] complete: ${copied} copied, ${failedRetry} will retry, ${failedPermanent} abandoned`);
+  return { copied, failedRetry, failedPermanent, total };
 }
 
 function formatDumpSummary(result) {
   const lines = [`Copied: ${result.copied}`];
 
-  const skipped = result.total - result.copied - result.failed;
+  const skipped = result.total - result.copied - result.failedRetry - result.failedPermanent;
   if (skipped > 0) lines.push(`Skipped (already backed up): ${skipped}`);
-  if (result.failed > 0) lines.push(`Failed: ${result.failed}`);
+  if (result.failedRetry > 0) lines.push(`Failed (will retry): ${result.failedRetry}`);
+  if (result.failedPermanent > 0) lines.push(`Abandoned (3 attempts): ${result.failedPermanent}`);
 
   return lines.join('\n');
 }
