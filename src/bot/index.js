@@ -1504,16 +1504,34 @@ async function runBackup(ctx, statusMsg, backupChannelId) {
   let failedRetry = 0;
   let failedPermanent = 0;
   let total = items.length;
+  let i = 0;
 
-  for (const item of items) {
+  while (i < items.length) {
+    const item = items[i];
     const check = db.prepare("SELECT backup_msg_id, backup_retries FROM media_index WHERE id = ?").get(item.id);
-    if (check && check.backup_msg_id != null) continue;
+    if (check && check.backup_msg_id != null) { i++; continue; }
 
     try {
       const m = await ctx.api.copyMessage(backupChannelId, item.source_chat_id, item.source_msg_id);
       db.prepare("UPDATE media_index SET backup_msg_id = ?, backup_retries = 0 WHERE id = ?").run(m.message_id, item.id);
       copied++;
+      i++;
     } catch (err) {
+      const retryAfter = parseRetryAfter(err.message);
+      if (retryAfter > 0) {
+        console.log(`[dump] RATE_LIMITED id=${item.id} waiting ${retryAfter}s`);
+        await delay((retryAfter + 1) * 1000);
+        continue;
+      }
+
+      if (err.message.includes('message to copy not found')) {
+        db.prepare("UPDATE media_index SET backup_msg_id = -1 WHERE id = ?").run(item.id);
+        failedPermanent++;
+        console.log(`[dump] DELETED id=${item.id} title="${item.title}" — abandoning`);
+        i++;
+        continue;
+      }
+
       const retries = (check?.backup_retries || 0) + 1;
       if (retries >= 3) {
         db.prepare("UPDATE media_index SET backup_msg_id = -1, backup_retries = ? WHERE id = ?").run(retries, item.id);
@@ -1524,6 +1542,7 @@ async function runBackup(ctx, statusMsg, backupChannelId) {
         failedRetry++;
         console.log(`[dump] FAILED id=${item.id} title="${item.title}" source=(${item.source_chat_id}, ${item.source_msg_id}) attempt=${retries}/3 ${err.message}`);
       }
+      i++;
     }
 
     const done = copied + failedRetry + failedPermanent;
@@ -1544,6 +1563,11 @@ async function runBackup(ctx, statusMsg, backupChannelId) {
 
   console.log(`[dump] complete: ${copied} copied, ${failedRetry} will retry, ${failedPermanent} abandoned`);
   return { copied, failedRetry, failedPermanent, total };
+}
+
+function parseRetryAfter(message) {
+  const match = message.match(/retry after (\d+)/i);
+  return match ? Number(match[1]) : 0;
 }
 
 function formatDumpSummary(result) {
