@@ -6,14 +6,17 @@
   "scripts": {
     "start": "node src/index.js",
     "login": "node src/login.js"
-  }, 
+  },
   "dependencies": {
     "grammy": "^1.42.0",
     "@grammyjs/conversations": "^2.1.0",
     "telegram": "^2.26.0",
-    "parse-torrent-title": "^3.0.0",
-    "better-sqlite3": "^11.0.0",
+    "parsium-media": "^1.0.0",
+    "better-sqlite3": "^12.4.0",
     "dotenv": "^16.4.0",
     "pino": "^9.0.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
   }
 }

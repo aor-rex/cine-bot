@@ -7,10 +7,13 @@ let bot;
 let initScanRunning = false;
 let ownerStatusNotifiedOffline = false;
 const EPISODES_PER_PAGE = 10;
-const REQUEST_UI_TTL_MS = 3 * 60 * 1000;
+const ANIME_RANGE_CHUNK = 50;
+const BULK_CONFIRM_THRESHOLD = 10;
+const REQUEST_UI_TTL_MS = 15 * 60 * 1000;
 const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
 const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
 const interactiveMessages = new Map();
+const inflightRequests = new Set();
 let dumpRunning = false;
 let dumpScheduleTimeout = null;
 
@@ -221,7 +224,7 @@ export async function startBot() {
       JOIN media_index m ON m.id = media_fts.rowid
       WHERE media_fts MATCH ?
       ORDER BY media_fts.rank
-      LIMIT 15
+      LIMIT 50
     `).all(query);
 
     if (results.length === 0) {
@@ -277,15 +280,18 @@ export async function startBot() {
     const items = db.prepare(`
       SELECT * FROM media_index WHERE id = ? OR title = (
         SELECT title FROM media_index WHERE id = ?
-      ) ORDER BY season, episode, file_size
+      ) ORDER BY season, COALESCE(absolute_episode, episode), file_size DESC
     `).all(id, id);
 
     if (items.length === 0) return ctx.answerCallbackQuery('Not found.');
 
     const first = items[0];
     const hasSeasons = items.some(i => i.season != null);
+    const isAnimeBulk = !hasSeasons && items.some(i => i.absolute_episode != null) && items.length > 20;
 
-    if (hasSeasons) {
+    if (isAnimeBulk) {
+      await renderAnimeRangePage(ctx, items);
+    } else if (hasSeasons) {
       const seasons = [...new Set(items.map(i => i.season).filter(s => s != null))].sort();
       const keyboard = new InlineKeyboard();
       for (const s of seasons) {
@@ -322,17 +328,28 @@ export async function startBot() {
     await ctx.answerCallbackQuery();
   });
 
-  // ── Episode selected ───────────────────────────────────
-  bot.callbackQuery(/^ep_(\d+)_(\d+)$/, async (ctx) => {
-    const episode = Number(ctx.match[1]);
-    const id = Number(ctx.match[2]);
+  // ── Episode selected (season-scoped; legacy ep_<e>_<id> supported) ──
+  bot.callbackQuery(/^ep_(?:(\d+)_)?(\d+)_(\d+)$/, async (ctx) => {
+    const season = ctx.match[1] != null ? Number(ctx.match[1]) : null;
+    const episode = Number(ctx.match[2]);
+    const id = Number(ctx.match[3]);
     const db = getDb();
-    const items = db.prepare(`
-      SELECT * FROM media_index
-      WHERE title = (SELECT title FROM media_index WHERE id = ?)
-        AND episode = ?
-      ORDER BY file_size DESC
-    `).all(id, episode);
+    let items;
+    if (season != null) {
+      items = db.prepare(`
+        SELECT * FROM media_index
+        WHERE title = (SELECT title FROM media_index WHERE id = ?)
+          AND season = ? AND episode = ?
+        ORDER BY file_size DESC
+      `).all(id, season, episode);
+    } else {
+      items = db.prepare(`
+        SELECT * FROM media_index
+        WHERE title = (SELECT title FROM media_index WHERE id = ?)
+          AND episode = ?
+        ORDER BY file_size DESC
+      `).all(id, episode);
+    }
 
     if (items.length === 0) return ctx.answerCallbackQuery('Not found.');
     await showVersions(ctx, id, items);
@@ -351,33 +368,106 @@ export async function startBot() {
     await forwardItems(ctx, [item]);
   });
 
-  // ── Send all ───────────────────────────────────────────
+  // ── Send all (per-episode deduped; confirm when above threshold) ──
   bot.callbackQuery(/^sendall_(\d+)(?:_(\d+))?$/, async (ctx) => {
     const id = Number(ctx.match[1]);
     const seasonFilter = ctx.match[2] ? Number(ctx.match[2]) : null;
     const db = getDb();
 
-    let items;
+    let rows;
     if (seasonFilter) {
-      items = db.prepare(`
+      rows = db.prepare(`
         SELECT * FROM media_index
         WHERE title = (SELECT title FROM media_index WHERE id = ?)
           AND season = ?
         ORDER BY episode, file_size DESC
       `).all(id, seasonFilter);
     } else {
-      items = db.prepare(`
+      rows = db.prepare(`
         SELECT * FROM media_index
         WHERE title = (SELECT title FROM media_index WHERE id = ?)
-        ORDER BY season, episode, file_size DESC
+        ORDER BY season, COALESCE(absolute_episode, episode), file_size DESC
       `).all(id);
     }
 
-    if (items.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
+    if (rows.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
+    const items = dedupePerEpisode(rows);
+
+    if (items.length > BULK_CONFIRM_THRESHOLD) {
+      const keyboard = new InlineKeyboard();
+      const scope = seasonFilter ? `sendallcf_${id}_${seasonFilter}` : `sendallcf_${id}`;
+      keyboard.text(`✅ Send ${items.length} files`, scope).row();
+      keyboard.text('❌ Cancel', 'cancel');
+      await ctx.editMessageText(
+        `📦 **${items.length} files**${totalSizeLine(items)}\n\nSend them to your DM?`,
+        { reply_markup: keyboard, parse_mode: 'Markdown' }
+      );
+      await ctx.answerCallbackQuery();
+      return;
+    }
 
     await ctx.editMessageText(`📤 Forwarding ${items.length} files...`);
     await ctx.answerCallbackQuery();
     await forwardItems(ctx, items);
+  });
+
+  // ── Bulk confirm ─────────────────────────────────────────
+  bot.callbackQuery(/^sendallcf_(\d+)(?:_(\d+))?$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const seasonFilter = ctx.match[2] ? Number(ctx.match[2]) : null;
+    const db = getDb();
+    const rows = seasonFilter
+      ? db.prepare(`SELECT * FROM media_index WHERE title = (SELECT title FROM media_index WHERE id = ?) AND season = ? ORDER BY episode, file_size DESC`).all(id, seasonFilter)
+      : db.prepare(`SELECT * FROM media_index WHERE title = (SELECT title FROM media_index WHERE id = ?) ORDER BY season, COALESCE(absolute_episode, episode), file_size DESC`).all(id);
+    if (rows.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
+    await ctx.editMessageText(`📤 Forwarding ${dedupePerEpisode(rows).length} files...`);
+    await ctx.answerCallbackQuery();
+    await forwardItems(ctx, dedupePerEpisode(rows));
+  });
+
+  // ── Anime range confirm/send ─────────────────────────────
+  bot.callbackQuery(/^animerange_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const from = Number(ctx.match[2]);
+    const to = Number(ctx.match[3]);
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT * FROM media_index
+      WHERE title = (SELECT title FROM media_index WHERE id = ?)
+        AND COALESCE(absolute_episode, episode) BETWEEN ? AND ?
+      ORDER BY COALESCE(absolute_episode, episode), file_size DESC
+    `).all(id, from, to);
+    if (rows.length === 0) return ctx.answerCallbackQuery('Nothing in this range.');
+    const items = dedupePerEpisode(rows);
+    if (items.length > BULK_CONFIRM_THRESHOLD) {
+      const keyboard = new InlineKeyboard();
+      keyboard.text(`✅ Send E${from}–E${to} (${items.length})`, `animesend_${id}_${from}_${to}`).row();
+      keyboard.text('❌ Cancel', 'cancel');
+      await ctx.editMessageText(`📦 **E${from}–E${to}: ${items.length} files**${totalSizeLine(items)}\n\nSend them to your DM?`,
+        { reply_markup: keyboard, parse_mode: 'Markdown' });
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    await ctx.editMessageText(`📤 Forwarding E${from}–E${to} (${items.length} files)...`);
+    await ctx.answerCallbackQuery();
+    await forwardItems(ctx, items);
+  });
+
+  bot.callbackQuery(/^animesend_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const from = Number(ctx.match[2]);
+    const to = Number(ctx.match[3]);
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT * FROM media_index
+      WHERE title = (SELECT title FROM media_index WHERE id = ?)
+        AND COALESCE(absolute_episode, episode) BETWEEN ? AND ?
+      ORDER BY COALESCE(absolute_episode, episode), file_size DESC
+    `).all(id, from, to);
+    if (rows.length === 0) return ctx.answerCallbackQuery('Nothing in this range.');
+    await ctx.editMessageText(`📤 Forwarding E${from}–E${to}...`);
+    await ctx.answerCallbackQuery();
+    await forwardItems(ctx, dedupePerEpisode(rows));
   });
 
   // ── Send all by quality ────────────────────────────────
@@ -391,12 +481,13 @@ export async function startBot() {
 
     let query = `SELECT * FROM media_index WHERE title = (SELECT title FROM media_index WHERE id = ?) AND season = ?`;
     const params = [id, season];
-    if (res !== null) { query += ` AND resolution = ?`; params.push(res); }
-    if (codec !== null) { query += ` AND codec = ?`; params.push(codec); }
-    query += ` ORDER BY episode`;
+    if (res !== null) { query += ` AND LOWER(COALESCE(quality_norm, resolution)) = LOWER(?)`; params.push(res); }
+    if (codec !== null) { query += ` AND LOWER(codec) = LOWER(?)`; params.push(codec); }
+    query += ` ORDER BY episode, file_size DESC`;
 
-    const items = db.prepare(query).all(...params);
-    if (items.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
+    const rows = db.prepare(query).all(...params);
+    if (rows.length === 0) return ctx.answerCallbackQuery('Nothing to send.');
+    const items = dedupePerEpisode(rows);
 
     await ctx.editMessageText(`📤 Forwarding ${items.length} files...`);
     await ctx.answerCallbackQuery();
@@ -411,9 +502,15 @@ export async function startBot() {
     if (!first) return ctx.answerCallbackQuery('Not found.');
 
     const items = db.prepare(
-      "SELECT * FROM media_index WHERE title = ? ORDER BY season, episode"
+      "SELECT * FROM media_index WHERE title = ? ORDER BY season, COALESCE(absolute_episode, episode)"
     ).all(first.title);
 
+    const hasSeasons = items.some(i => i.season != null);
+    if (!hasSeasons && items.length > 20) {
+      await renderAnimeRangePage(ctx, items);
+      await ctx.answerCallbackQuery();
+      return;
+    }
     const seasons = [...new Set(items.map(i => i.season).filter(s => s != null))].sort();
     const keyboard = new InlineKeyboard();
     for (const s of seasons) {
@@ -693,28 +790,41 @@ export async function startBot() {
     }
 
     const { parseFilename } = await import('../parser/index.js');
-    const parsed = parseFilename(filename);
-    if (!parsed) return;
+    const parsed = parseFilename(filename, { db });
+    if (!parsed) {
+      try {
+        db.prepare(`INSERT OR IGNORE INTO parse_rejects (raw_filename, reason, source_chat_id, source_msg_id)
+          VALUES (?, ?, ?, ?)`).run(filename, 'unparsable', chatId, msgId);
+      } catch {}
+      return;
+    }
 
     db.prepare(`
       INSERT OR IGNORE INTO media_index
-        (title, year, season, episode, resolution, source, codec,
-         audio, channels, language, release_group, file_type,
+        (title, year, season, episode, absolute_episode, episode_end, episode_title,
+         resolution, quality_norm, source, codec,
+         audio, channels, language, release_group, version, edition, file_type,
          package_id, part_number, file_size,
          source_chat_id, source_msg_id, raw_filename)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       normalizeDbValue(parsed.title),
       normalizeDbValue(parsed.year || null),
-      normalizeDbValue(parsed.season || null),
-      normalizeDbValue(parsed.episode || null),
+      normalizeDbValue(parsed.season ?? null),
+      normalizeDbValue(parsed.episode ?? null),
+      normalizeDbValue(parsed.absolute_episode ?? null),
+      normalizeDbValue(parsed.episode_end ?? null),
+      normalizeDbValue(parsed.episode_title || null),
       normalizeDbValue(parsed.resolution || null),
+      normalizeDbValue(parsed.quality_norm || null),
       normalizeDbValue(parsed.source || null),
       normalizeDbValue(parsed.codec || null),
       normalizeDbValue(parsed.audio || null),
       normalizeDbValue(parsed.channels || null),
       normalizeDbValue(parsed.language || null),
-      normalizeDbValue(parsed.group || null),
+      normalizeDbValue(parsed.release_group || parsed.group || null),
+      normalizeDbValue(parsed.version ?? 1),
+      normalizeDbValue(parsed.edition || null),
       normalizeDbValue(parsed.file_type),
       normalizeDbValue(parsed.package_id || null),
       normalizeDbValue(parsed.part_number || null),
@@ -767,7 +877,7 @@ async function showVersions(ctx, id, items) {
 
   const seen = new Set();
   const deduped = items.filter(i => {
-    const key = `${i.resolution}|${i.codec}|${i.source}`;
+    const key = `${(i.quality_norm || i.resolution || '').toLowerCase()}|${(i.codec || '').toLowerCase()}|${(i.source || '').toLowerCase()}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -805,7 +915,7 @@ async function renderSeasonEpisodePage(ctx, items, season, page) {
     const label = `E${String(e).padStart(2, '0')}`;
     keyboard.text(
       versions.length > 1 ? `${label} (${versions.length})` : label,
-      `ep_${e}_${first.id}`
+      `ep_${season}_${e}_${first.id}`
     ).row();
   }
 
@@ -837,51 +947,133 @@ async function renderSeasonEpisodePage(ctx, items, season, page) {
 
 async function forwardItems(ctx, items) {
   const db = getDb();
-  const targetChatId = ctx.chat.id;
+  // Always deliver to the requester's DM, even when requested from a group.
+  const targetChatId = ctx.from.id;
+  const inflightKey = `${ctx.from.id}`;
+  if (inflightRequests.has(inflightKey)) {
+    await ctx.answerCallbackQuery('Already sending — please wait.').catch(() => {});
+    return;
+  }
+  inflightRequests.add(inflightKey);
+  try {
+    await ensureAutoDeleteTable(db);
+    let sent = 0;
+    let failed = 0;
+    const fileIds = [];
 
-  let sent = 0;
-  let failed = 0;
-  const fileIds = [];
-
-  for (const item of items) {
-    try {
-      if (item.package_id && item.total_parts > 1) {
-        const parts = db.prepare(
-          "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
-        ).all(item.package_id);
-        for (const p of parts) {
-          const m = await ctx.api.copyMessage(targetChatId, p.source_chat_id, p.source_msg_id);
-          fileIds.push(m.message_id);
-          await delay(200);
+    for (let idx = 0; idx < items.length; idx++) {
+      const item = items[idx];
+      try {
+        if (item.package_id) {
+          const parts = db.prepare(
+            "SELECT * FROM media_index WHERE package_id = ? ORDER BY part_number"
+          ).all(item.package_id);
+          const list = parts.length ? parts : [item];
+          for (const p of list) {
+            await copyWithRetry(ctx, targetChatId, p, fileIds);
+          }
+        } else {
+          await copyWithRetry(ctx, targetChatId, item, fileIds);
         }
-      } else {
-        const m = await ctx.api.copyMessage(targetChatId, item.source_chat_id, item.source_msg_id);
-        fileIds.push(m.message_id);
+        sent++;
+      } catch (err) {
+        failed++;
+        console.log(`[delivery] failed ${item.raw_filename || item.id}: ${err?.message || err}`);
       }
-      sent++;
-    } catch {
-      failed++;
+
+      if ((idx + 1) % 5 === 0 || idx === items.length - 1) {
+        await ctx.editMessageText(`📤 Sending ${idx + 1}/${items.length}...`).catch(() => {});
+      }
+      if ((idx + 1) % 5 === 0) await delay(1000);
     }
 
-    if (sent % 5 === 0) await delay(1000);
-  }
+    const errPart = failed > 0 ? ` (${failed} failed)` : '';
+    const deleteDelay = getAutoDeleteDelayMs();
+    const dmNote = ctx.chat.id !== targetChatId ? '\n\nSent to your DM.' : '';
+    await ctx.editMessageText(
+      `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.\n\nSave the files to **Saved Messages** before they are deleted.${dmNote}`
+    ).catch(() => {});
 
-  const errPart = failed > 0 ? ` (${failed} failed)` : '';
-  const deleteDelay = getAutoDeleteDelayMs();
-  await ctx.editMessageText(
-    `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.\n\nSave the files to **Saved Messages** before they are deleted.`
-  );
-
-  if (fileIds.length) {
-    setTimeout(async () => {
-      for (const msgId of fileIds) {
-        try { await ctx.api.deleteMessage(targetChatId, msgId); } catch {}
-      }
+    if (fileIds.length) {
+      const expiresAt = Date.now() + deleteDelay;
       try {
-        await ctx.api.sendMessage(targetChatId, '🗑 file has been deleted.');
+        const stmt = db.prepare("INSERT INTO auto_delete (chat_id, message_id, expires_at) VALUES (?, ?, ?)");
+        const ins = db.transaction((ids) => { for (const mid of ids) stmt.run(targetChatId, mid, expiresAt); });
+        ins(fileIds);
       } catch {}
-    }, deleteDelay);
+      setTimeout(async () => {
+        await sweepAutoDelete(ctx, db, targetChatId, fileIds);
+      }, deleteDelay);
+    }
+  } finally {
+    inflightRequests.delete(inflightKey);
   }
+}
+
+async function copyWithRetry(ctx, targetChatId, item, fileIds, attempt = 0) {
+  try {
+    const m = await ctx.api.copyMessage(targetChatId, item.source_chat_id, item.source_msg_id);
+    fileIds.push(m.message_id);
+    return;
+  } catch (err) {
+    // Fallback to backup copy when the source message is gone.
+    if (item.backup_msg_id && item.backup_msg_id > 0 && attempt === 0) {
+      try {
+        const backupChat = await getBackupChatId(ctx);
+        if (backupChat) {
+          const m = await ctx.api.copyMessage(targetChatId, backupChat, item.backup_msg_id);
+          fileIds.push(m.message_id);
+          return;
+        }
+      } catch {}
+    }
+    const waitMs = parseFloodWaitMs(err);
+    if (waitMs != null && attempt < 3) {
+      await delay(waitMs);
+      return copyWithRetry(ctx, targetChatId, item, fileIds, attempt + 1);
+    }
+    if (err?.description === 'bot was blocked by the user' || err?.error_code === 403) {
+      throw new Error('bot-blocked: start a DM with the bot first, then retry');
+    }
+    throw err;
+  }
+}
+
+function parseFloodWaitMs(err) {
+  const raw = err?.parameters?.retry_after ?? err?.retry_after;
+  if (raw != null) return (Number(raw) + 1) * 1000;
+  const m = String(err?.description || err?.message || '').match(/retry after (\d+)/i);
+  return m ? (Number(m[1]) + 1) * 1000 : null;
+}
+
+async function getBackupChatId(ctx) {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT value FROM bot_settings WHERE key = 'backup_channel_id'").get();
+    if (row?.value) return Number(row.value);
+  } catch {}
+  return null;
+}
+
+async function ensureAutoDeleteTable(db) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS auto_delete (
+      chat_id INTEGER NOT NULL,
+      message_id INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (chat_id, message_id)
+    )`);
+  } catch {}
+}
+
+async function sweepAutoDelete(ctx, db, chatId, fileIds) {
+  for (const msgId of fileIds) {
+    try { await ctx.api.deleteMessage(chatId, msgId); } catch {}
+  }
+  try { db.prepare("DELETE FROM auto_delete WHERE chat_id = ?").run(chatId); } catch {}
+  try {
+    await ctx.api.sendMessage(chatId, '🗑 file has been deleted.');
+  } catch {}
 }
 
 function delay(ms) {
@@ -1019,10 +1211,52 @@ function refreshInteractiveMessage(ctx) {
 function getSeasonQualityGroups(id, season) {
   const db = getDb();
   return db.prepare(`
-    SELECT DISTINCT resolution, codec FROM media_index
+    SELECT DISTINCT COALESCE(quality_norm, resolution) AS resolution, codec FROM media_index
     WHERE title = (SELECT title FROM media_index WHERE id = ?)
       AND season = ?
   `).all(id, season);
+}
+
+// One row per episode: input must be pre-sorted with preferred quality first
+// (file_size DESC); keeps first occurrence of each season|absolute|episode key.
+function dedupePerEpisode(rows) {
+  const seen = new Set();
+  const out = [];
+  for (const r of rows) {
+    const key = `${r.season ?? '-'}|${r.absolute_episode ?? r.episode ?? '-'}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+function totalSizeLine(items) {
+  const bytes = items.reduce((a, i) => a + (i.file_size || 0), 0);
+  return bytes ? ` (~${formatSize(bytes)})` : '';
+}
+
+async function renderAnimeRangePage(ctx, items) {
+  const first = items[0];
+  const nums = [...new Set(items.map((i) => i.absolute_episode ?? i.episode).filter((e) => e != null))].sort((a, b) => a - b);
+  if (nums.length === 0) return showVersions(ctx, first.id, items);
+  const min = nums[0];
+  const max = nums[nums.length - 1];
+  const keyboard = new InlineKeyboard();
+  for (let s = min; s <= max; s += ANIME_RANGE_CHUNK) {
+    const e = Math.min(s + ANIME_RANGE_CHUNK - 1, max);
+    keyboard.text(`E${s}–E${e}`, `animerange_${first.id}_${s}_${e}`).row();
+  }
+  const latest = nums.slice(-20);
+  if (nums.length > 20) {
+    keyboard.text(`Latest 20 (E${latest[0]}–E${latest[latest.length - 1]})`, `animerange_${first.id}_${latest[0]}_${latest[latest.length - 1]}`).row();
+  }
+  const quals = [...new Set(items.map((i) => (i.quality_norm || i.resolution || 'Mixed').toUpperCase()))];
+  keyboard.text('❌ Cancel', 'cancel');
+  await ctx.editMessageText(
+    `**${first.title}** — ${nums.length} episodes (E${min}–E${max})\nQuality: ${quals.join(', ')}\n\nPick a range (one file per episode):`,
+    { reply_markup: keyboard, parse_mode: 'Markdown' }
+  );
 }
 
 function formatInitScanSummary(result) {

@@ -47,11 +47,12 @@ export async function initScan() {
 
   const insertStmt = db.prepare(`
     INSERT OR IGNORE INTO media_index
-      (title, year, season, episode, resolution, source, codec,
-       audio, channels, language, release_group, file_type,
+      (title, year, season, episode, absolute_episode, episode_end, episode_title,
+       resolution, quality_norm, source, codec,
+       audio, channels, language, release_group, version, edition, file_type,
        package_id, part_number, file_size,
        source_chat_id, source_msg_id, raw_filename)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const messageExistsStmt = db.prepare(
     "SELECT id FROM media_index WHERE source_chat_id = ? AND source_msg_id = ?"
@@ -87,23 +88,35 @@ export async function initScan() {
           continue;
         }
 
-        const parsed = parseFilename(filename);
-        if (!parsed) continue;
+        const parsed = parseFilename(filename, { db });
+        if (!parsed) {
+          try {
+            db.prepare(`INSERT OR IGNORE INTO parse_rejects (raw_filename, reason, source_chat_id, source_msg_id)
+              VALUES (?, ?, ?, ?)`).run(filename, 'unparsable', chatId, msg.id);
+          } catch {}
+          continue;
+        }
 
         const fileSize = normalizeDbValue(msg.file?.size || 0);
 
         batch.push([
           normalizeDbValue(parsed.title),
           normalizeDbValue(parsed.year || null),
-          normalizeDbValue(parsed.season || null),
-          normalizeDbValue(parsed.episode || null),
+          normalizeDbValue(parsed.season ?? null),
+          normalizeDbValue(parsed.episode ?? null),
+          normalizeDbValue(parsed.absolute_episode ?? null),
+          normalizeDbValue(parsed.episode_end ?? null),
+          normalizeDbValue(parsed.episode_title || null),
           normalizeDbValue(parsed.resolution || null),
+          normalizeDbValue(parsed.quality_norm || null),
           normalizeDbValue(parsed.source || null),
           normalizeDbValue(parsed.codec || null),
           normalizeDbValue(parsed.audio || null),
           normalizeDbValue(parsed.channels || null),
           normalizeDbValue(parsed.language || null),
-          normalizeDbValue(parsed.group || null),
+          normalizeDbValue(parsed.release_group || parsed.group || null),
+          normalizeDbValue(parsed.version ?? 1),
+          normalizeDbValue(parsed.edition || null),
           normalizeDbValue(parsed.file_type || 'video'),
           normalizeDbValue(parsed.package_id || null),
           normalizeDbValue(parsed.part_number || null),

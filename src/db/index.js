@@ -28,14 +28,19 @@ function initSchema(db) {
       year INTEGER,
       season INTEGER,
       episode INTEGER,
+      absolute_episode INTEGER,
+      episode_end INTEGER,
       episode_title TEXT,
       resolution TEXT,
+      quality_norm TEXT,
       source TEXT,
       codec TEXT,
       audio TEXT,
       channels REAL,
       language TEXT,
       release_group TEXT,
+      version INTEGER DEFAULT 1,
+      edition TEXT,
       file_type TEXT NOT NULL DEFAULT 'video',
       package_id TEXT,
       part_number INTEGER,
@@ -70,10 +75,26 @@ function initSchema(db) {
       VALUES ('delete', old.id, old.title, old.episode_title, old.release_group);
     END;
 
+    CREATE TRIGGER IF NOT EXISTS media_au AFTER UPDATE ON media_index BEGIN
+      INSERT INTO media_fts(media_fts, rowid, title, episode_title, release_group)
+      VALUES ('delete', old.id, old.title, old.episode_title, old.release_group);
+      INSERT INTO media_fts(rowid, title, episode_title, release_group)
+      VALUES (new.id, new.title, new.episode_title, new.release_group);
+    END;
+
     CREATE TABLE IF NOT EXISTS title_overrides (
       raw_pattern TEXT PRIMARY KEY,
       corrected_title TEXT NOT NULL,
       match_type TEXT DEFAULT 'exact'
+    );
+
+    CREATE TABLE IF NOT EXISTS parse_rejects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      raw_filename TEXT NOT NULL,
+      reason TEXT,
+      source_chat_id INTEGER,
+      source_msg_id INTEGER,
+      created_at TEXT DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS owners (
@@ -108,6 +129,30 @@ function initSchema(db) {
 
   // Migration: add backup_retries column if missing (existing DBs)
   try { db.exec("ALTER TABLE media_index ADD COLUMN backup_retries INTEGER DEFAULT 0"); } catch {}
+
+  // Migration: parsium-era columns (absolute numbering, ranges, normalized quality)
+  try { db.exec("ALTER TABLE media_index ADD COLUMN absolute_episode INTEGER"); } catch {}
+  try { db.exec("ALTER TABLE media_index ADD COLUMN episode_end INTEGER"); } catch {}
+  try { db.exec("ALTER TABLE media_index ADD COLUMN quality_norm TEXT"); } catch {}
+  try { db.exec("ALTER TABLE media_index ADD COLUMN version INTEGER DEFAULT 1"); } catch {}
+  try { db.exec("ALTER TABLE media_index ADD COLUMN edition TEXT"); } catch {}
+  try { db.exec("ALTER TABLE media_index ADD COLUMN episode_title TEXT"); } catch {}
+  try { db.exec("CREATE INDEX IF NOT EXISTS idx_media_title_abs ON media_index(title, absolute_episode)"); } catch {}
+  try { db.exec("CREATE INDEX IF NOT EXISTS idx_media_title_quality ON media_index(title, season, quality_norm)"); } catch {}
+  try {
+    db.exec(`CREATE TRIGGER IF NOT EXISTS media_au AFTER UPDATE ON media_index BEGIN
+      INSERT INTO media_fts(media_fts, rowid, title, episode_title, release_group)
+      VALUES ('delete', old.id, old.title, old.episode_title, old.release_group);
+      INSERT INTO media_fts(rowid, title, episode_title, release_group)
+      VALUES (new.id, new.title, new.episode_title, new.release_group);
+    END;`);
+  } catch {}
+
+  // Seed: arc-title aliases (bare title grouping)
+  try {
+    db.prepare(`INSERT OR IGNORE INTO title_overrides (raw_pattern, corrected_title, match_type)
+      VALUES ('Jujutsu Kaisen The Culling Game Part 1', 'Jujutsu Kaisen', 'exact')`).run();
+  } catch {}
 }
 
 export function closeDb() {
