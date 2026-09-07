@@ -2,6 +2,18 @@ import { parse } from 'parsium-media';
 
 // Noise prefixes stripped before parsing (kept in raw_filename)
 const NOISE_PREFIX_RE = /^(\[REQ\]\s*|ATM\.\s*)+/i;
+// Unbracketed release-group prefixes pasted in front of the title
+const UNBRACKETED_GROUP_RE = /^(AnimeRG|AniFlix\w*|K-ANIME|Otaku_TV|Anime_Wars|Anime_Series_Z|For_Otaku)[\s_\-]+/i;
+// Markdown-link paste artifacts: "[text](url)" tails
+const MARKDOWN_LINK_RE = /\[[^\]]*\]\([^)]*\)/g;
+// Unclosed junk brackets: "[@Group", "[720p-Sub][@For_Otaku"
+const UNCLOSED_BRACKET_RE = /\[@[^\]]*$/;
+// Reversed order: "E01 - Title Arc" / "Ep 12 - Title" -> "Title Arc - E01"
+const REVERSED_EP_RE = /^(E(?:p(?:isode)?)?\s?\.?\s?\d{1,4}(?:\s*[~\-–]\s*\d{1,4})?)\s*[-–]\s*(.+)$/i;
+// Bare-number reversed, only with bracket evidence (quality/group tags):
+// "01 - Solo Leveling [Otaku_TV][1080p]" -> "Solo Leveling [Otaku_TV][1080p] - 01"
+// Title-less "01 - Kitchen" (no brackets) stays unparsable by design.
+const REVERSED_BARE_RE = /^(\d{1,4})\s*[-–]\s*(.+\[.+\].*)$/;
 // Release version: v2, v3 (parsium drops it — extract from raw)
 const VERSION_RE = /v(\d)(?![\d])/i;
 // Resolution written as dimensions: 1920x1080 -> 1080p
@@ -39,7 +51,20 @@ export function parseFilename(filename, opts = {}) {
 }
 
 function preprocess(filename) {
-  return filename.replace(NOISE_PREFIX_RE, '');
+  let name = filename.replace(NOISE_PREFIX_RE, '');
+  // Strip markdown-link artifacts and unclosed junk brackets
+  name = name.replace(MARKDOWN_LINK_RE, '');
+  name = name.replace(UNCLOSED_BRACKET_RE, '');
+  // Strip unbracketed group prefixes (repeat: "AnimeRG ... ", "K-ANIME_...")
+  let prev;
+  do {
+    prev = name;
+    name = name.replace(UNBRACKETED_GROUP_RE, '');
+  } while (name !== prev);
+  // Rotate reversed "E01 - Title" order into parsium-friendly "Title - E01"
+  const rev = name.match(REVERSED_EP_RE) || name.match(REVERSED_BARE_RE);
+  if (rev) name = `${rev[2].trim()} - ${rev[1].trim()}`;
+  return name.trim();
 }
 
 function mapParsium(p, originalFilename, db) {
