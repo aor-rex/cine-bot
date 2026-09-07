@@ -97,6 +97,14 @@ function initSchema(db) {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS request_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL,
+      user_id INTEGER,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_request_log_title ON request_log(title);
+
     CREATE TABLE IF NOT EXISTS owners (
       user_id INTEGER PRIMARY KEY
     );

@@ -1,9 +1,10 @@
-import { Bot, InlineKeyboard } from 'grammy';
+import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { config } from '../config.js';
 import { getDb } from '../db/index.js';
 import { initScan } from '../init-scan.js';
 
 let bot;
+let botUsername = '';
 let initScanRunning = false;
 let ownerStatusNotifiedOffline = false;
 const EPISODES_PER_PAGE = 10;
@@ -14,6 +15,14 @@ const MIN_AUTO_DELETE_MS = 5 * 60 * 1000;
 const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
 const interactiveMessages = new Map();
 const inflightRequests = new Set();
+const pendingTitlePrompt = new Set();
+
+function mainKeyboard() {
+  return new Keyboard()
+    .text('🔎 Search').text('🎬 Browse').row()
+    .text('⭐ Trending').text('❓ Help').row()
+    .resized();
+}
 let dumpRunning = false;
 let dumpScheduleTimeout = null;
 
@@ -28,6 +37,10 @@ export async function startBot() {
   scheduleNextDump();
 
   bot = new Bot(config.botToken);
+  try {
+    const me = await bot.api.getMe();
+    botUsername = me.username || '';
+  } catch {}
 
   await registerBotCommands(bot);
   registerShutdownNotifications(bot);
@@ -60,7 +73,8 @@ export async function startBot() {
     if (!isPrivate) {
       return ctx.reply(
         '🎬 **Cine is ready in this group.**\n\n'
-        + '`/request <title>` — search movies and series\n'
+        + '`/search <title>` — or just type the title in my DM\n'
+        + (botUsername ? `You can also use me inline: \`@${botUsername} <title>\` in any chat\n` : '')
         + '`/cancel` — cancel the current action',
         { parse_mode: 'Markdown' }
       );
@@ -68,12 +82,14 @@ export async function startBot() {
 
     const baseMessage =
       '👋 Welcome to **Cine**!\n\n'
-      + '`/request <title>` — search movies and series\n'
-      + '`/cancel` — cancel the current action';
+      + 'Just **type a movie or series title** to search — no commands needed.\n'
+      + '`/search <title>` works too.\n'
+      + '`/cancel` — cancel the current action\n'
+      + '`/help` — how to use Cine';
 
     if (!isOwner) {
       return ensureDmAccess(ctx, async () => {
-        await ctx.reply(baseMessage, { parse_mode: 'Markdown' });
+        await ctx.reply(baseMessage, { parse_mode: 'Markdown', reply_markup: mainKeyboard() });
       });
     }
 
@@ -86,12 +102,53 @@ export async function startBot() {
       + '`/setrequired <id> <link>` — set required channel gate\n'
       + '`/clearrequired` — clear required channel gate\n'
       + '`/initscan` — run the backfill command locally',
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'Markdown', reply_markup: mainKeyboard() }
     );
   });
 
   bot.command('myid', (ctx) => {
     ctx.reply(`Your user ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
+  });
+
+  bot.command('help', (ctx) => {
+    const inlineLine = botUsername ? `\n• Inline anywhere: \`@${botUsername} bleach\`` : '';
+    return ctx.reply(
+      '❓ **How to use Cine**\n\n'
+      + '• Just **type a title** in this DM — e.g. `bleach`\n'
+      + '• Or `/search bleach`' + inlineLine + '\n'
+      + '• Pick the title, then season → episode → quality\n'
+      + '• Long anime (One Piece, Bleach, Naruto): pick an **episode range** like `E1–E50` or `Latest 20`\n'
+      + '• Ranges over 10 files ask for confirmation first\n'
+      + '• Files are always delivered **to this DM** and auto-delete in ~5–7 min — save them to Saved Messages\n'
+      + '• `/cancel` — close the current menu',
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.hears('🔎 Search', (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    pendingTitlePrompt.add(ctx.from.id);
+    return ctx.reply('What are you looking for? Send the movie or series title.');
+  });
+
+  bot.hears('🎬 Browse', async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    const keyboard = new InlineKeyboard();
+    keyboard.text('📺 Anime', 'browse_anime').row();
+    keyboard.text('🎬 Movies', 'browse_movies').row();
+    keyboard.text('📼 Series', 'browse_series').row();
+    keyboard.text('❌ Cancel', 'cancel');
+    await ctx.reply('**Browse** — pick a shelf:', { reply_markup: keyboard, parse_mode: 'Markdown' });
+  });
+
+  bot.hears('⭐ Trending', async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    await sendTrending(ctx);
+  });
+
+  bot.hears('❓ Help', (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    return ctx.reply('Tap /help for the full guide.');
   });
 
   bot.command('initscan', async (ctx) => {
@@ -205,21 +262,34 @@ export async function startBot() {
     }
   });
 
-  // ── /request ────────────────────────────────────────────
-  bot.command('request', async (ctx) => {
-    const accessBlocked = await ensureDmAccess(ctx);
-    if (accessBlocked) return;
-
+  // ── /search (+ legacy /request alias) ───────────────────
+  bot.command(['search', 'request'], async (ctx) => {
     const query = ctx.match?.trim();
     if (!query) {
-      return ctx.reply('Usage: `/request <movie or series title>`', { parse_mode: 'Markdown' });
+      return ctx.reply('Send `/search <movie or series title>` — or just type the title.', { parse_mode: 'Markdown' });
     }
+    await runSearch(ctx, query);
+  });
+
+  // ── Plain text in DM = search (no command needed) ─────────
+  bot.on('message:text', async (ctx) => {
+    if (ctx.message.entities?.some((e) => e.type === 'bot_command')) return;
+    if (ctx.chat?.type !== 'private') return;
+    if (isSourceChat(getDb(), ctx.chat.id)) return;
+    const query = ctx.message.text?.trim();
+    if (!query || query.length < 2) return;
+    await runSearch(ctx, query);
+  });
+
+  async function runSearch(ctx, query) {
+    const accessBlocked = await ensureDmAccess(ctx);
+    if (accessBlocked) return;
 
     const db = getDb();
     const results = db.prepare(`
       SELECT m.id, m.title, m.year, m.season, m.episode,
-             m.resolution, m.codec, m.source, m.file_type,
-             m.file_size, m.source_msg_id
+             m.absolute_episode, m.resolution, m.quality_norm, m.codec,
+             m.source, m.file_type, m.file_size, m.source_msg_id
       FROM media_fts
       JOIN media_index m ON m.id = media_fts.rowid
       WHERE media_fts MATCH ?
@@ -261,16 +331,74 @@ export async function startBot() {
     }
 
     const keyboard = new InlineKeyboard();
-    for (const [_, g] of groups) {
-      const label = g.year ? `${g.title} (${g.year})` : g.title;
+    const shown = [...groups.values()].slice(0, 8);
+    for (const g of shown) {
+      const eps = new Set(g.items.map((i) => i.absolute_episode ?? (i.season != null ? `${i.season}:${i.episode}` : i.episode)).filter((e) => e != null)).size;
+      const quals = [...new Set(g.items.map((i) => (i.quality_norm || i.resolution || '').toUpperCase()).filter(Boolean))].slice(0, 2);
+      const meta = [eps ? `${eps} ep${eps === 1 ? '' : 's'}` : null, quals.join('/') || null].filter(Boolean).join(' · ');
+      const label = `${g.year ? `${g.title} (${g.year})` : g.title}${meta ? ` — ${meta}` : ''}`;
       keyboard.text(label, `sel_${g.items[0].id}`).row();
+    }
+    if (groups.size > shown.length) {
+      keyboard.text(`More (${groups.size - shown.length} hidden) — refine your title`, 'noop').row();
     }
     keyboard.text('❌ Cancel', 'cancel');
 
-    const sent = await ctx.reply(`📁 **${results.length} result(s) for "${query}":**`, {
+    const sent = await ctx.reply(`📁 **${groups.size} title(s) for "${query}":**`, {
       reply_markup: keyboard, parse_mode: 'Markdown',
     });
     trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
+  }
+
+  // ── Inline mode: @bot <title> in any chat ──────────────
+  bot.inlineQuery(async (ctx) => {
+    const q = ctx.inlineQuery.query?.trim();
+    if (!q) {
+      return ctx.answerInlineQuery([], {
+        switch_pm_text: 'Type a title to search Cine',
+        switch_pm_parameter: 'inline',
+      });
+    }
+    const db = getDb();
+    let rows = [];
+    try {
+      rows = db.prepare(`
+        SELECT m.id, m.title, m.year FROM media_fts
+        JOIN media_index m ON m.id = media_fts.rowid
+        WHERE media_fts MATCH ?
+        ORDER BY media_fts.rank
+        LIMIT 30
+      `).all(q);
+    } catch {
+      return ctx.answerInlineQuery([]);
+    }
+    const seen = new Set();
+    const articles = [];
+    for (const r of rows) {
+      const key = `${r.title}|${r.year || 0}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (articles.length >= 10) break;
+      const stats = db.prepare(`
+        SELECT COUNT(*) AS n,
+               COUNT(DISTINCT COALESCE(absolute_episode, episode)) AS eps,
+               MAX(COALESCE(quality_norm, resolution)) AS q
+        FROM media_index WHERE title = ?
+      `).get(r.title);
+      const desc = `${stats.eps || stats.n} episode(s)${r.year ? ` · ${r.year}` : ''}${stats.q ? ` · ${stats.q}` : ''}`;
+      articles.push({
+        type: 'article',
+        id: `sel_${r.id}`,
+        title: r.title,
+        description: desc,
+        input_message_content: {
+          message_text: `🎬 **${r.title}**${r.year ? ` (${r.year})` : ''}\n${desc}\n\nTap below to browse:`,
+          parse_mode: 'Markdown',
+        },
+        reply_markup: new InlineKeyboard().text(`📁 Open ${r.title}`, `sel_${r.id}`),
+      });
+    }
+    return ctx.answerInlineQuery(articles, { cache_time: 30 });
   });
 
   // ── Title selected ─────────────────────────────────────
@@ -286,6 +414,9 @@ export async function startBot() {
     if (items.length === 0) return ctx.answerCallbackQuery('Not found.');
 
     const first = items[0];
+    try {
+      db.prepare("INSERT INTO request_log (title, user_id) VALUES (?, ?)").run(first.title, ctx.from.id);
+    } catch {}
     const hasSeasons = items.some(i => i.season != null);
     const isAnimeBulk = !hasSeasons && items.some(i => i.absolute_episode != null) && items.length > 20;
 
@@ -494,6 +625,50 @@ export async function startBot() {
     await forwardItems(ctx, items);
   });
 
+  // ── Browse shelves ─────────────────────────────────────
+  bot.callbackQuery(/^browse_(anime|movies|series)$/, async (ctx) => {
+    const shelf = ctx.match[1];
+    const db = getDb();
+    let rows;
+    if (shelf === 'anime') {
+      rows = db.prepare(`
+        SELECT title, COUNT(*) AS n FROM media_index
+        WHERE absolute_episode IS NOT NULL
+        GROUP BY title ORDER BY n DESC LIMIT 8
+      `).all();
+    } else if (shelf === 'movies') {
+      rows = db.prepare(`
+        SELECT title, year, COUNT(*) AS n FROM media_index
+        WHERE season IS NULL AND absolute_episode IS NULL
+        GROUP BY title, year ORDER BY n DESC LIMIT 8
+      `).all();
+    } else {
+      rows = db.prepare(`
+        SELECT title, COUNT(*) AS n FROM media_index
+        WHERE season IS NOT NULL
+        GROUP BY title ORDER BY n DESC LIMIT 8
+      `).all();
+    }
+    if (rows.length === 0) return ctx.answerCallbackQuery('Shelf is empty.');
+    const keyboard = new InlineKeyboard();
+    for (const r of rows) {
+      const idRow = db.prepare("SELECT id FROM media_index WHERE title = ? LIMIT 1").get(r.title);
+      if (!idRow) continue;
+      keyboard.text(`⭐ ${r.title}${r.year ? ` (${r.year})` : ''} · ${r.n}`, `sel_${idRow.id}`).row();
+    }
+    keyboard.text('❌ Cancel', 'cancel');
+    const names = { anime: '📺 Anime', movies: '🎬 Movies', series: '📼 Series' };
+    await ctx.editMessageText(`**${names[shelf]}** — top titles:`, {
+      reply_markup: keyboard, parse_mode: 'Markdown',
+    });
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('trending', async (ctx) => {
+    await sendTrending(ctx, true);
+    await ctx.answerCallbackQuery();
+  });
+
   // ── Navigation ─────────────────────────────────────────
   bot.callbackQuery(/^titleback_(\d+)$/, async (ctx) => {
     const id = Number(ctx.match[1]);
@@ -526,7 +701,12 @@ export async function startBot() {
   });
 
   bot.callbackQuery('back', async (ctx) => {
-    await ctx.editMessageText('◀ Back. Use `/request <title>` to search again.');
+    await ctx.editMessageText('◀ Back. Use `/search <title>` to search again.');
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery('research', async (ctx) => {
+    await ctx.editMessageText('🔎 Send me a title — just type it, e.g. `bleach`.', { parse_mode: 'Markdown' });
     await ctx.answerCallbackQuery();
   });
 
@@ -885,8 +1065,9 @@ async function showVersions(ctx, id, items) {
 
   for (const v of deduped) {
     const size = v.file_size ? ` (${formatSize(v.file_size)})` : '';
-    const label = [v.resolution, v.source, v.codec, v.audio].filter(Boolean).join(' ').toUpperCase();
-    keyboard.text(`${label}${size}`, `fwd_${v.id}`).row();
+    const icon = sourceIcon(v.source);
+    const label = [v.quality_norm || v.resolution, v.source, v.codec, v.audio].filter(Boolean).join(' ').toUpperCase();
+    keyboard.text(`${icon} ${label}${size}`, `fwd_${v.id}`).row();
   }
 
   keyboard.text('📦 Send All', `sendall_${first.id}`).row();
@@ -959,6 +1140,7 @@ async function forwardItems(ctx, items) {
     await ensureAutoDeleteTable(db);
     let sent = 0;
     let failed = 0;
+    let blocked = false;
     const fileIds = [];
 
     for (let idx = 0; idx < items.length; idx++) {
@@ -978,6 +1160,7 @@ async function forwardItems(ctx, items) {
         sent++;
       } catch (err) {
         failed++;
+        if (String(err?.message || '').startsWith('bot-blocked')) blocked = true;
         console.log(`[delivery] failed ${item.raw_filename || item.id}: ${err?.message || err}`);
       }
 
@@ -987,11 +1170,28 @@ async function forwardItems(ctx, items) {
       if ((idx + 1) % 5 === 0) await delay(1000);
     }
 
+    if (sent === 0 && blocked) {
+      const link = dmDeepLink();
+      const keyboard = new InlineKeyboard();
+      if (link) keyboard.url('📩 Open my DM', link).row();
+      keyboard.text('🔎 Search again', 'research').row();
+      keyboard.text('❌ Cancel', 'cancel');
+      await ctx.editMessageText(
+        '⚠️ **I can\'t DM you yet.**\n\nTap below to start me, then come back and retry.',
+        { reply_markup: keyboard, parse_mode: 'Markdown' }
+      ).catch(() => {});
+      return;
+    }
+
     const errPart = failed > 0 ? ` (${failed} failed)` : '';
     const deleteDelay = getAutoDeleteDelayMs();
     const dmNote = ctx.chat.id !== targetChatId ? '\n\nSent to your DM.' : '';
+    const keyboard = new InlineKeyboard();
+    keyboard.text('🔎 Search again', 'research').row();
+    keyboard.text('❌ Cancel', 'cancel');
     await ctx.editMessageText(
-      `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.\n\nSave the files to **Saved Messages** before they are deleted.${dmNote}`
+      `✅ Sent ${sent}/${items.length} files${errPart}. Auto-deletes in about ${formatAutoDeleteMinutes(deleteDelay)} minutes.\n\nSave the files to **Saved Messages** before they are deleted.${dmNote}`,
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
     ).catch(() => {});
 
     if (fileIds.length) {
@@ -1234,6 +1434,52 @@ function dedupePerEpisode(rows) {
 function totalSizeLine(items) {
   const bytes = items.reduce((a, i) => a + (i.file_size || 0), 0);
   return bytes ? ` (~${formatSize(bytes)})` : '';
+}
+
+async function sendTrending(ctx, isEdit = false) {
+  const db = getDb();
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT title, COUNT(*) AS n FROM request_log
+      WHERE datetime(created_at) > datetime('now', '-30 days')
+      GROUP BY title ORDER BY n DESC LIMIT 8
+    `).all();
+  } catch {}
+  if (rows.length === 0) {
+    rows = db.prepare(`
+      SELECT title, COUNT(*) AS n FROM media_index
+      GROUP BY title ORDER BY n DESC LIMIT 8
+    `).all();
+  }
+  if (rows.length === 0) {
+    const text = '⭐ Nothing trending yet — try a search first.';
+    return isEdit ? ctx.editMessageText(text) : ctx.reply(text);
+  }
+  const keyboard = new InlineKeyboard();
+  for (const r of rows) {
+    const idRow = db.prepare("SELECT id FROM media_index WHERE title = ? LIMIT 1").get(r.title);
+    if (!idRow) continue;
+    keyboard.text(`⭐ ${r.title} · ${r.n}`, `sel_${idRow.id}`).row();
+  }
+  keyboard.text('❌ Cancel', 'cancel');
+  const text = '**⭐ Trending** — most requested:';
+  return isEdit
+    ? ctx.editMessageText(text, { reply_markup: keyboard, parse_mode: 'Markdown' })
+    : ctx.reply(text, { reply_markup: keyboard, parse_mode: 'Markdown' });
+}
+
+function dmDeepLink() {
+  return botUsername ? `https://t.me/${botUsername}?start=dm` : null;
+}
+
+function sourceIcon(source) {
+  const s = String(source || '').toLowerCase();
+  if (s.includes('bluray') || s === 'bd') return '💿';
+  if (s.includes('web')) return '🌐';
+  if (s.includes('hdtv') || s.includes('tv')) return '📺';
+  if (s.includes('dvd')) return '📀';
+  return '🎬';
 }
 
 async function renderAnimeRangePage(ctx, items) {
@@ -1490,14 +1736,16 @@ function extractTelegramUsername(input) {
 async function registerBotCommands(bot) {
   await bot.api.setMyCommands([
     { command: 'start', description: 'Start the bot' },
-    { command: 'request', description: 'Search for a movie or series' },
+    { command: 'search', description: 'Search for a movie or series' },
+    { command: 'help', description: 'How to use Cine' },
     { command: 'cancel', description: 'Cancel the current action' },
   ]);
 
   await bot.api.setMyCommands(
     [
       { command: 'start', description: 'Start the bot' },
-      { command: 'request', description: 'Search for a movie or series' },
+      { command: 'search', description: 'Search for a movie or series' },
+      { command: 'help', description: 'How to use Cine' },
       { command: 'cancel', description: 'Cancel the current action' },
       { command: 'source', description: 'Show saved source chats' },
       { command: 'myid', description: 'Show your Telegram user ID' },
