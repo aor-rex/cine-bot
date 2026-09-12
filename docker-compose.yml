@@ -1,0 +1,46 @@
+# One-deploy stack: cine-bot + local Telegram Bot API server.
+#
+# Why the second service exists:
+#   - No torrent traffic ever touches these containers (debrid does the P2P).
+#   - But Telegram's *cloud* Bot API caps bot uploads at 50MB, whether the
+#     bytes come from disk or a URL passthrough. Movies exceed that.
+#   - The local Bot API server raises the cap to 2000MB. It is a separate
+#     TDLib binary, so it runs as a sibling container, not library code.
+#
+# Usage (Dokploy: deploy this compose file as one project):
+#   1. Fill .env (BOT_TOKEN, OWNER_USER_ID, TORBOX_API_KEY, API_ID, API_HASH).
+#   2. Deploy. The bot talks to the API server over the internal network.
+#   3. data/ must be on persistent storage (SQLite index + fetch temp).
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BOT_API_BASE_URL: http://bot-api:8081
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - bot-api
+
+  bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    command: >-
+      telegram-bot-api
+      --local
+      --http-port=8081
+      --dir=/var/lib/telegram-bot-api
+      --temp-dir=/tmp/telegram-bot-api
+      --api-id=${API_ID}
+      --api-hash=${API_HASH}
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+      - bot-api-temp:/tmp/telegram-bot-api
+    # Internal only: no ports published. The bot reaches it at http://bot-api:8081.
+
+volumes:
+  bot-api-data:
+  bot-api-temp:
