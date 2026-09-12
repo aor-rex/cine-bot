@@ -290,16 +290,38 @@ export async function startBot() {
     if (accessBlocked) return;
 
     const db = getDb();
-    const results = db.prepare(`
-      SELECT m.id, m.title, m.year, m.season, m.episode,
-             m.absolute_episode, m.resolution, m.quality_norm, m.codec,
-             m.source, m.file_type, m.file_size, m.source_msg_id
-      FROM media_fts
-      JOIN media_index m ON m.id = media_fts.rowid
-      WHERE media_fts MATCH ?
-      ORDER BY media_fts.rank
-      LIMIT 50
-    `).all(query);
+    const ftsQuery = sanitizeFtsQuery(query);
+    let results = [];
+    if (ftsQuery) {
+      results = db.prepare(`
+        SELECT m.id, m.title, m.year, m.season, m.episode,
+               m.absolute_episode, m.resolution, m.quality_norm, m.codec,
+               m.source, m.file_type, m.file_size, m.source_msg_id
+        FROM media_fts
+        JOIN media_index m ON m.id = media_fts.rowid
+        WHERE media_fts MATCH ?
+        ORDER BY media_fts.rank
+        LIMIT 50
+      `).all(ftsQuery);
+    }
+    // AND yielded nothing: retry as token-OR before fuzzy/miss path
+    if (results.length === 0) {
+      const orQuery = orFtsQuery(ftsQuery);
+      if (orQuery && orQuery !== ftsQuery) {
+        try {
+          results = db.prepare(`
+            SELECT m.id, m.title, m.year, m.season, m.episode,
+                   m.absolute_episode, m.resolution, m.quality_norm, m.codec,
+                   m.source, m.file_type, m.file_size, m.source_msg_id
+            FROM media_fts
+            JOIN media_index m ON m.id = media_fts.rowid
+            WHERE media_fts MATCH ?
+            ORDER BY media_fts.rank
+            LIMIT 50
+          `).all(orQuery);
+        } catch {}
+      }
+    }
 
     if (results.length === 0) {
       const suggestions = findCloseMatches(db, query);
@@ -342,6 +364,9 @@ export async function startBot() {
     }
     if (groups.size > shown.length) {
       keyboard.text(`More (${groups.size - shown.length} hidden) — refine your title`, 'noop').row();
+    }
+    if (isOwnerCtx(ctx) && shown.length) {
+      keyboard.text(`🌊 Fetch "${query}" from torrents`, `fetchmenu_${shown[0].items[0].id}`).row();
     }
     keyboard.text('❌ Cancel', 'cancel');
 
@@ -431,6 +456,7 @@ export async function startBot() {
         keyboard.text(`Season ${s} (${eps.length} eps)`, `season_${s}_${first.id}_0`).row();
       }
       keyboard.text('📦 Send All Seasons', `sendall_${first.id}`).row();
+      if (isOwnerCtx(ctx)) keyboard.text('🌊 Fetch more of this', `fetchmenu_${first.id}`).row();
       keyboard.text('◀ Back', 'back').text('❌ Cancel', 'cancel');
       await ctx.editMessageText(`**${first.title}** — select season:`, {
         reply_markup: keyboard, parse_mode: 'Markdown',
@@ -674,45 +700,27 @@ export async function startBot() {
   bot.callbackQuery(/^fetchq_(\d+)$/, async (ctx) => {
     if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
     const pendingId = Number(ctx.match[1]);
-    const db = getDb();
-    const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
-    if (!pend) return ctx.answerCallbackQuery('Request expired.');
-    const { debridConfigured } = await import('../fetch/debrid.js');
-    if (!debridConfigured()) {
-      await ctx.answerCallbackQuery();
-      return ctx.editMessageText('❌ `TORBOX_API_KEY` is not set on the server.', { parse_mode: 'Markdown' });
-    }
-    await ctx.editMessageText(`🌊 Searching torrents for "${pend.query}"...`);
     await ctx.answerCallbackQuery();
-    const { searchTorrents, collapseByQuality } = await import('../fetch/sources.js');
-    const { checkCached } = await import('../fetch/debrid.js');
-    let candidates = [];
+    await renderFetchOptions(ctx, pendingId);
+  });
+
+  // ── Owner fetch from any result screen (creates pending row from title) ──
+  bot.callbackQuery(/^fetchmenu_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    const mediaId = Number(ctx.match[1]);
+    const db = getDb();
+    const row = db.prepare('SELECT title FROM media_index WHERE id = ?').get(mediaId);
+    if (!row) return ctx.answerCallbackQuery('Not found.');
+    let pendingId = 0;
     try {
-      candidates = await searchTorrents(pend.query);
-    } catch (err) {
-      return ctx.editMessageText(`❌ Torrent search failed: ${err.message}`);
-    }
-    if (!candidates.length) {
-      return ctx.editMessageText(`❌ No torrents found for "${pend.query}".`);
-    }
-    const options = collapseByQuality(candidates);
-    // Cache flags for top options only (bounded API calls)
-    for (const o of options) {
-      try {
-        o.cached = (await checkCached(o.magnet)).cached;
-      } catch { o.cached = false; }
-    }
-    // Stash options server-side for pick step
-    fetchOptionCache.set(pendingId, options);
-    const keyboard = new InlineKeyboard();
-    for (let i = 0; i < options.length; i++) {
-      keyboard.text(fetchOptionLabel(options[i]), `fetchpick_${pendingId}_${i}`).row();
-    }
-    keyboard.text('❌ Cancel', 'cancel');
-    await ctx.editMessageText(
-      `🌊 **${pend.query}** — ${options.length} options:`,
-      { reply_markup: keyboard, parse_mode: 'Markdown' }
-    );
+      pendingId = Number(db.prepare(`
+        INSERT INTO pending_requests (query, user_id, chat_id, chat_title, user_name, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+      `).run(row.title, ctx.from.id, ctx.chat.id, ctx.chat.title || null, ctx.from.username || String(ctx.from.id)).lastInsertRowid);
+    } catch {}
+    if (!pendingId) return ctx.answerCallbackQuery('Failed.');
+    await ctx.answerCallbackQuery();
+    await renderFetchOptions(ctx, pendingId);
   });
 
   // ── Owner fetch: confirm one option ──────────────────────
@@ -1191,6 +1199,7 @@ async function showVersions(ctx, id, items) {
   }
 
   keyboard.text('📦 Send All', `sendall_${first.id}`).row();
+  if (ctx.from?.id === config.ownerUserId) keyboard.text('🌊 Fetch more of this', `fetchmenu_${first.id}`).row();
   keyboard.text('❌ Cancel', 'cancel');
 
   const header = first.season
@@ -1670,6 +1679,23 @@ function dmDeepLink() {
   return botUsername ? `https://t.me/${botUsername}?start=dm` : null;
 }
 
+// Strip FTS5 operators from user text so punctuation can't zero-out/throw MATCH.
+// Also splits CJK/emoji-adjacent runs by treating non-alphanumerics as spaces.
+function sanitizeFtsQuery(q) {
+  return String(q || '')
+    .replace(/["()*^:]/g, ' ')
+    .replace(/[-–—]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Token-OR form for recall fallback: "brand new day" -> "brand OR new OR day"
+function orFtsQuery(sanitized) {
+  const toks = String(sanitized || '').split(' ').filter((t) => t.length > 1);
+  if (toks.length < 2) return sanitized;
+  return toks.map((t) => `"${t.replace(/"/g, '')}"`).join(' OR ');
+}
+
 function sourceIcon(source) {
   const s = String(source || '').toLowerCase();
   if (s.includes('bluray') || s === 'bd') return '💿';
@@ -1687,6 +1713,51 @@ function fetchOptionLabel(o) {
   const codec = p.codec || '';
   const size = o.size ? ` · ${formatSize(o.size)}` : '';
   return `${mark} ${q} ${src} ${codec}${size} · ${o.seeders} seeds`.replace(/\s+/g, ' ').trim();
+}
+
+function isOwnerCtx(ctx) {
+  return ctx.from?.id === config.ownerUserId;
+}
+
+async function renderFetchOptions(ctx, pendingId) {
+  const db = getDb();
+  const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
+  if (!pend) {
+    await ctx.answerCallbackQuery('Request expired.').catch(() => {});
+    return;
+  }
+  const { debridConfigured } = await import('../fetch/debrid.js');
+  if (!debridConfigured()) {
+    return ctx.editMessageText('❌ `TORBOX_API_KEY` is not set on the server.', { parse_mode: 'Markdown' });
+  }
+  await ctx.editMessageText(`🌊 Searching torrents for "${pend.query}"...`);
+  const { searchTorrents, collapseByQuality } = await import('../fetch/sources.js');
+  const { checkCached } = await import('../fetch/debrid.js');
+  let candidates = [];
+  try {
+    candidates = await searchTorrents(pend.query);
+  } catch (err) {
+    return ctx.editMessageText(`❌ Torrent search failed: ${err.message}`);
+  }
+  if (!candidates.length) {
+    return ctx.editMessageText(`❌ No torrents found for "${pend.query}".`);
+  }
+  const options = collapseByQuality(candidates);
+  for (const o of options) {
+    try {
+      o.cached = (await checkCached(o.magnet)).cached;
+    } catch { o.cached = false; }
+  }
+  fetchOptionCache.set(pendingId, options);
+  const keyboard = new InlineKeyboard();
+  for (let i = 0; i < options.length; i++) {
+    keyboard.text(fetchOptionLabel(options[i]), `fetchpick_${pendingId}_${i}`).row();
+  }
+  keyboard.text('❌ Cancel', 'cancel');
+  await ctx.editMessageText(
+    `🌊 **${pend.query}** — ${options.length} options:`,
+    { reply_markup: keyboard, parse_mode: 'Markdown' }
+  );
 }
 
 // ── Fetch completion pipeline: debrid -> backup channel -> index -> serve ──
@@ -1834,6 +1905,7 @@ async function renderAnimeRangePage(ctx, items) {
     keyboard.text(`Latest 20 (E${latest[0]}–E${latest[latest.length - 1]})`, `animerange_${first.id}_${latest[0]}_${latest[latest.length - 1]}`).row();
   }
   const quals = [...new Set(items.map((i) => (i.quality_norm || i.resolution || 'Mixed').toUpperCase()))];
+  if (ctx.from?.id === config.ownerUserId) keyboard.text('🌊 Fetch more of this', `fetchmenu_${first.id}`).row();
   keyboard.text('❌ Cancel', 'cancel');
   await ctx.editMessageText(
     `**${first.title}** — ${nums.length} episodes (E${min}–E${max})\nQuality: ${quals.join(', ')}\n\nPick a range (one file per episode):`,
