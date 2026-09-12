@@ -21,7 +21,7 @@ services:
     environment:
       BOT_API_BASE_URL: http://bot-api:8081
     volumes:
-      - ./data:/app/data
+      - cine-db2:/app/data
     depends_on:
       - bot-api
 
@@ -42,5 +42,9 @@ services:
     # Internal only: no ports published. The bot reaches it at http://bot-api:8081.
 
 volumes:
+  # Restored production index. Managed outside compose: create/restore it as
+  # `cine-db2` first (Dokploy volume restore), compose only attaches it.
+  cine-db2:
+    external: true
   bot-api-data:
   bot-api-temp:
