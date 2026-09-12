@@ -105,6 +105,41 @@ function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_request_log_title ON request_log(title);
 
+    CREATE TABLE IF NOT EXISTS miss_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      chat_id INTEGER,
+      notified_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_miss_log_query ON miss_log(query);
+
+    CREATE TABLE IF NOT EXISTS pending_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
+      chat_id INTEGER NOT NULL,
+      chat_title TEXT,
+      user_name TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_query ON pending_requests(query, status);
+
+    CREATE TABLE IF NOT EXISTS fetch_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      magnet TEXT,
+      torrent_title TEXT,
+      torrent_size INTEGER,
+      seeders INTEGER,
+      cached INTEGER DEFAULT 0,
+      torbox_id INTEGER,
+      status TEXT DEFAULT 'queued',
+      requested_by INTEGER,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS owners (
       user_id INTEGER PRIMARY KEY
     );
@@ -161,6 +196,9 @@ function initSchema(db) {
     db.prepare(`INSERT OR IGNORE INTO title_overrides (raw_pattern, corrected_title, match_type)
       VALUES ('Jujutsu Kaisen The Culling Game Part 1', 'Jujutsu Kaisen', 'exact')`).run();
   } catch {}
+
+  // Migration: torbox id on fetch jobs
+  try { db.exec('ALTER TABLE fetch_jobs ADD COLUMN torbox_id INTEGER'); } catch {}
 }
 
 export function closeDb() {

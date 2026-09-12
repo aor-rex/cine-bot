@@ -16,6 +16,8 @@ const MAX_AUTO_DELETE_MS = 7 * 60 * 1000;
 const interactiveMessages = new Map();
 const inflightRequests = new Set();
 const pendingTitlePrompt = new Set();
+// Owner fetch option stash: pendingId -> ranked torrent candidates
+const fetchOptionCache = new Map();
 
 function mainKeyboard() {
   return new Keyboard()
@@ -36,7 +38,9 @@ export async function startBot() {
 
   scheduleNextDump();
 
-  bot = new Bot(config.botToken);
+  bot = process.env.BOT_API_BASE_URL
+    ? new Bot(config.botToken, { client: { baseURL: process.env.BOT_API_BASE_URL } })
+    : new Bot(config.botToken);
   try {
     const me = await bot.api.getMe();
     botUsername = me.username || '';
@@ -299,25 +303,22 @@ export async function startBot() {
 
     if (results.length === 0) {
       const suggestions = findCloseMatches(db, query);
-      if (suggestions.length === 0) {
-        return ctx.reply(
-          `❌ No matches for "${query}".\n\nTry the full title, fewer words, or a release year.`,
-          { parse_mode: 'Markdown' }
+      if (suggestions.length > 0) {
+        const keyboard = new InlineKeyboard();
+        for (const suggestion of suggestions) {
+          const label = suggestion.year ? `${suggestion.title} (${suggestion.year})` : suggestion.title;
+          keyboard.text(label, `sel_${suggestion.id}`).row();
+        }
+        keyboard.text('❌ Cancel', 'cancel');
+
+        const sent = await ctx.reply(
+          `🔎 No exact matches for "${query}".\n\nDid you mean one of these?`,
+          { reply_markup: keyboard, parse_mode: 'Markdown' }
         );
+        trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
+        return;
       }
-
-      const keyboard = new InlineKeyboard();
-      for (const suggestion of suggestions) {
-        const label = suggestion.year ? `${suggestion.title} (${suggestion.year})` : suggestion.title;
-        keyboard.text(label, `sel_${suggestion.id}`).row();
-      }
-      keyboard.text('❌ Cancel', 'cancel');
-
-      const sent = await ctx.reply(
-        `🔎 No exact matches for "${query}".\n\nDid you mean one of these?`,
-        { reply_markup: keyboard, parse_mode: 'Markdown' }
-      );
-      trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
+      await handleMiss(ctx, db, query);
       return;
     }
 
@@ -667,6 +668,125 @@ export async function startBot() {
   bot.callbackQuery('trending', async (ctx) => {
     await sendTrending(ctx, true);
     await ctx.answerCallbackQuery();
+  });
+
+  // ── Owner fetch: torrent options ───────────────────────
+  bot.callbackQuery(/^fetchq_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    const pendingId = Number(ctx.match[1]);
+    const db = getDb();
+    const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
+    if (!pend) return ctx.answerCallbackQuery('Request expired.');
+    const { debridConfigured } = await import('../fetch/debrid.js');
+    if (!debridConfigured()) {
+      await ctx.answerCallbackQuery();
+      return ctx.editMessageText('❌ `TORBOX_API_KEY` is not set on the server.', { parse_mode: 'Markdown' });
+    }
+    await ctx.editMessageText(`🌊 Searching torrents for "${pend.query}"...`);
+    await ctx.answerCallbackQuery();
+    const { searchTorrents, collapseByQuality } = await import('../fetch/sources.js');
+    const { checkCached } = await import('../fetch/debrid.js');
+    let candidates = [];
+    try {
+      candidates = await searchTorrents(pend.query);
+    } catch (err) {
+      return ctx.editMessageText(`❌ Torrent search failed: ${err.message}`);
+    }
+    if (!candidates.length) {
+      return ctx.editMessageText(`❌ No torrents found for "${pend.query}".`);
+    }
+    const options = collapseByQuality(candidates);
+    // Cache flags for top options only (bounded API calls)
+    for (const o of options) {
+      try {
+        o.cached = (await checkCached(o.magnet)).cached;
+      } catch { o.cached = false; }
+    }
+    // Stash options server-side for pick step
+    fetchOptionCache.set(pendingId, options);
+    const keyboard = new InlineKeyboard();
+    for (let i = 0; i < options.length; i++) {
+      keyboard.text(fetchOptionLabel(options[i]), `fetchpick_${pendingId}_${i}`).row();
+    }
+    keyboard.text('❌ Cancel', 'cancel');
+    await ctx.editMessageText(
+      `🌊 **${pend.query}** — ${options.length} options:`,
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
+    );
+  });
+
+  // ── Owner fetch: confirm one option ──────────────────────
+  bot.callbackQuery(/^fetchpick_(\d+)_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    const pendingId = Number(ctx.match[1]);
+    const idx = Number(ctx.match[2]);
+    const options = fetchOptionCache.get(pendingId) || [];
+    const opt = options[idx];
+    if (!opt) return ctx.answerCallbackQuery('Option expired.');
+    const db = getDb();
+    const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
+    const p = opt.parsed || {};
+    const size = opt.size ? ` · ${formatSize(opt.size)}` : '';
+    const keyboard = new InlineKeyboard();
+    keyboard.text('✅ Fetch & Send', `fetchgo_${pendingId}_${idx}`).row();
+    keyboard.text('◀ Options', `fetchq_${pendingId}`).text('❌ Cancel', 'cancel');
+    await ctx.editMessageText(
+      `📦 **${p.title || opt.name}**${p.year ? ` (${p.year})` : ''}\n`
+      + `${opt.cached ? '⚡ Cached — ready in ~1 min' : '⏳ Uncached — queued, slower'}\n`
+      + `🎞 ${(p.quality_norm || '?').toUpperCase()} ${(p.source || '')} ${(p.codec || '')}\n`
+      + `💾${size} · ${opt.seeders} seeds · by ${p.release_group || opt.source}`,
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
+    );
+    await ctx.answerCallbackQuery();
+    void pend;
+  });
+
+  // ── Owner fetch: queue + run ─────────────────────────────
+  bot.callbackQuery(/^fetchgo_(\d+)_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    const pendingId = Number(ctx.match[1]);
+    const idx = Number(ctx.match[2]);
+    const options = fetchOptionCache.get(pendingId) || [];
+    const opt = options[idx];
+    if (!opt) return ctx.answerCallbackQuery('Option expired.');
+    const db = getDb();
+    const jobId = db.prepare(`
+      INSERT INTO fetch_jobs (query, magnet, torrent_title, torrent_size, seeders, cached, status, requested_by)
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
+    `).run(
+      db.prepare('SELECT query FROM pending_requests WHERE id = ?').get(pendingId)?.query || opt.parsed?.title || 'fetch',
+      opt.magnet, opt.name, opt.size || 0, opt.seeders || 0, opt.cached ? 1 : 0, ctx.from.id
+    ).lastInsertRowid;
+    await ctx.editMessageText(opt.cached ? '📤 Fetching (cached, ~1 min)…' : `⏳ Queued${opt.cached ? '' : ' (uncached, may take a while)'}. I'll ping you on completion.`);
+    await ctx.answerCallbackQuery();
+    runFetchPipeline(Number(jobId)).catch(async (err) => {
+      try {
+        db.prepare("UPDATE fetch_jobs SET status = 'failed' WHERE id = ?").run(Number(jobId));
+        await ctx.api.sendMessage(config.ownerUserId, `❌ Fetch #${jobId} failed: ${err.message}`);
+      } catch {}
+    });
+  });
+
+  bot.callbackQuery(/^fetchcancel_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    const db = getDb();
+    db.prepare("UPDATE fetch_jobs SET status = 'cancelled' WHERE id = ?").run(Number(ctx.match[1]));
+    await ctx.editMessageText('⏹ Fetch cancelled.');
+    await ctx.answerCallbackQuery();
+  });
+
+  bot.command('queue', async (ctx) => {
+    if (ctx.chat?.type !== 'private' || ctx.from.id !== config.ownerUserId) {
+      return ctx.reply('⛔ This command is only available in the owner DM.');
+    }
+    const db = getDb();
+    const rows = db.prepare("SELECT * FROM fetch_jobs WHERE status IN ('queued','fetching','ready') ORDER BY id DESC LIMIT 10").all();
+    if (!rows.length) return ctx.reply('No active fetch jobs.');
+    const keyboard = new InlineKeyboard();
+    for (const j of rows) {
+      keyboard.text(`❌ #${j.id} ${j.query} (${j.status})`, `fetchcancel_${j.id}`).row();
+    }
+    await ctx.reply('**Fetch queue:**', { reply_markup: keyboard, parse_mode: 'Markdown' });
   });
 
   // ── Navigation ─────────────────────────────────────────
@@ -1436,6 +1556,83 @@ function totalSizeLine(items) {
   return bytes ? ` (~${formatSize(bytes)})` : '';
 }
 
+// ── Miss handling: log, queue pending, notify owner (24h guard) ──
+async function handleMiss(ctx, db, query) {
+  const isOwner = ctx.from?.id === config.ownerUserId;
+  const normQuery = query.toLowerCase();
+  const chatId = ctx.chat.id;
+  const isPrivate = ctx.chat?.type === 'private';
+
+  let pendingId = 0;
+  try {
+    pendingId = Number(db.prepare(`
+      INSERT INTO pending_requests (query, user_id, chat_id, chat_title, user_name, status)
+      VALUES (?, ?, ?, ?, ?, 'pending')
+    `).run(
+      query, ctx.from.id, chatId,
+      isPrivate ? null : (ctx.chat.title || null),
+      [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || ctx.from.username || String(ctx.from.id)
+    ).lastInsertRowid);
+  } catch {}
+
+  if (isOwner) {
+    const keyboard = new InlineKeyboard();
+    keyboard.text('🌊 Fetch from torrents', `fetchq_${pendingId}`).row();
+    keyboard.text('❌ Cancel', 'cancel');
+    const sent = await ctx.reply(
+      `🔎 No matches for "${query}".\n\nFetch it via torrents?`,
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
+    );
+    trackInteractiveMessage(sent.chat.id, sent.message_id, ctx.from.id);
+    return;
+  }
+
+  await ctx.reply(
+    `❌ "${query}" isn't in the library yet.\n\nThe owner has been notified — you'll get it in your DM if it's fetched.`,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Notify owner at most once per title+chat per 24h
+  try {
+    const recent = db.prepare(`
+      SELECT id FROM miss_log
+      WHERE query = ? AND chat_id = ?
+        AND datetime(notified_at) > datetime('now', '-1 day')
+      LIMIT 1
+    `).get(normQuery, chatId);
+    if (recent) return;
+    db.prepare("INSERT INTO miss_log (query, chat_id) VALUES (?, ?)").run(normQuery, chatId);
+  } catch { return; }
+
+  await notifyOwnerOfMiss(ctx, db, query);
+}
+
+async function notifyOwnerOfMiss(ctx, db, query) {
+  if (!config.ownerUserId) return;
+  let waiting = 0;
+  try {
+    waiting = db.prepare(`
+      SELECT COUNT(DISTINCT user_id) AS c FROM pending_requests
+      WHERE LOWER(query) = LOWER(?) AND status = 'pending'
+    `).get(query).c;
+  } catch {}
+  const where = ctx.chat?.type === 'private'
+    ? 'in DM'
+    : `in ${ctx.chat.title || 'a group'}`;
+  const who = ctx.from.username ? `@${ctx.from.username}` : ([ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || String(ctx.from.id));
+  const keyboard = new InlineKeyboard();
+  const myPending = db.prepare("SELECT id FROM pending_requests WHERE LOWER(query) = LOWER(?) AND user_id = ? AND chat_id = ? ORDER BY id DESC LIMIT 1").get(query, ctx.from.id, ctx.chat.id);
+  keyboard.text('🌊 Fetch from torrents', `fetchq_${myPending?.id || 0}`).row();
+  keyboard.text('🙈 Dismiss', 'cancel');
+  try {
+    await ctx.api.sendMessage(
+      config.ownerUserId,
+      `🔔 **Missed request**\n"${query}" — asked by ${who} ${where}${waiting > 1 ? `\n${waiting} waiting` : ''}`,
+      { reply_markup: keyboard, parse_mode: 'Markdown' }
+    );
+  } catch {}
+}
+
 async function sendTrending(ctx, isEdit = false) {
   const db = getDb();
   let rows = [];
@@ -1480,6 +1677,145 @@ function sourceIcon(source) {
   if (s.includes('hdtv') || s.includes('tv')) return '📺';
   if (s.includes('dvd')) return '📀';
   return '🎬';
+}
+
+function fetchOptionLabel(o) {
+  const p = o.parsed || {};
+  const mark = o.cached ? '⚡' : '⏳';
+  const q = (p.quality_norm || '?').toUpperCase();
+  const src = p.source || '';
+  const codec = p.codec || '';
+  const size = o.size ? ` · ${formatSize(o.size)}` : '';
+  return `${mark} ${q} ${src} ${codec}${size} · ${o.seeders} seeds`.replace(/\s+/g, ' ').trim();
+}
+
+// ── Fetch completion pipeline: debrid -> backup channel -> index -> serve ──
+async function runFetchPipeline(jobId) {
+  const db = getDb();
+  const { addMagnet, torrentStatus, downloadLink } = await import('../fetch/debrid.js');
+  const { pickMediaFile, downloadToTemp, ensureFetchTmp, PASSTHROUGH_MAX_BYTES } = await import('../fetch/jobs.js');
+  const { parseFilename } = await import('../parser/index.js');
+  const { InputFile } = await import('grammy');
+
+  const job = db.prepare('SELECT * FROM fetch_jobs WHERE id = ?').get(jobId);
+  if (!job) throw new Error('job vanished');
+  const failIfCancelled = () => {
+    const s = db.prepare('SELECT status FROM fetch_jobs WHERE id = ?').get(jobId)?.status;
+    if (s === 'cancelled') throw new Error('cancelled by owner');
+  };
+
+  db.prepare("UPDATE fetch_jobs SET status = 'fetching', updated_at = datetime('now') WHERE id = ?").run(jobId);
+  const created = await addMagnet(job.magnet, 1);
+  const torboxId = created?.torrent_id || created?.id;
+  if (!torboxId) throw new Error('debrid rejected magnet');
+  try { db.prepare('UPDATE fetch_jobs SET torbox_id = ? WHERE id = ?').run(torboxId, jobId); } catch {}
+  try {
+    await bot.api.sendMessage(config.ownerUserId, `⏳ Fetch #${jobId} downloading from swarm…`);
+  } catch {}
+
+  // Poll (max ~2h)
+  let files = [];
+  for (let i = 0; i < 240; i++) {
+    failIfCancelled();
+    const st = await torrentStatus(torboxId);
+    const state = String(st.state || '').toLowerCase();
+    if (['completed', 'seeding', 'cached', 'downloaded'].includes(state)) { files = st.files; break; }
+    if (['failed', 'error'].includes(state)) throw new Error(`debrid: ${st.state}`);
+    await new Promise((r) => setTimeout(r, 30_000));
+  }
+  if (!files.length) throw new Error('debrid timed out');
+  const media = await pickMediaFile(files);
+  if (!media) throw new Error('no media file in torrent');
+  const url = await downloadLink(torboxId, media.id);
+
+  const backupId = getBackupChannelSetting(db);
+  if (!backupId) throw new Error('no backup channel set (/setbackup first)');
+
+  // Post to backup channel: URL passthrough first (zero disk), pipe fallback
+  let posted;
+  const caption = `${job.query}`;
+  if ((media.size || 0) <= PASSTHROUGH_MAX_BYTES) {
+    try {
+      posted = await bot.api.sendDocument(backupId, new InputFile({ url }), { caption });
+    } catch {
+      posted = null;
+    }
+  }
+  let tmpPath = null;
+  if (!posted) {
+    ensureFetchTmp();
+    tmpPath = await downloadToTemp(url, media.name);
+    try {
+      posted = await bot.api.sendDocument(backupId, new InputFile(tmpPath), { caption });
+    } finally {
+      try { (await import('fs')).unlinkSync(tmpPath); } catch {}
+    }
+  }
+  if (!posted) throw new Error('upload to backup channel failed');
+
+  // Index with known-good metadata (parsed from torrent name)
+  const parsed = parseFilename(media.name || job.torrent_title || job.query, { db });
+  db.prepare(`
+    INSERT OR IGNORE INTO media_index
+      (title, year, season, episode, absolute_episode, episode_end, episode_title,
+       resolution, quality_norm, source, codec, audio, channels, language,
+       release_group, version, edition, file_type, file_size,
+       source_chat_id, source_msg_id, raw_filename)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'video', ?, ?, ?, ?)
+  `).run(
+    parsed?.title || job.query,
+    parsed?.year ?? null, parsed?.season ?? null, parsed?.episode ?? null,
+    parsed?.absolute_episode ?? null, parsed?.episode_end ?? null, parsed?.episode_title ?? null,
+    parsed?.resolution ?? null, parsed?.quality_norm ?? null, parsed?.source ?? null,
+    parsed?.codec ?? null, parsed?.audio ?? null, parsed?.channels ?? null,
+    parsed?.language ?? null, parsed?.release_group ?? null, parsed?.version ?? 1,
+    parsed?.edition ?? null, media.size || 0,
+    backupId, posted.message_id, media.name || job.torrent_title || job.query
+  );
+
+  db.prepare("UPDATE fetch_jobs SET status = 'done', updated_at = datetime('now') WHERE id = ?").run(jobId);
+
+  // Serve all waiting requesters for this query
+  const waiting = db.prepare(`
+    SELECT DISTINCT user_id, chat_id, chat_title, query FROM pending_requests
+    WHERE LOWER(query) = LOWER(?) AND status = 'pending'
+  `).all(job.query);
+  const row = db.prepare('SELECT * FROM media_index WHERE source_chat_id = ? AND source_msg_id = ?').get(backupId, posted.message_id);
+  let delivered = 0;
+  const groups = new Map();
+  for (const w of waiting) {
+    try {
+      if (row) {
+        await bot.api.copyMessage(w.user_id, backupId, posted.message_id);
+        delivered++;
+      }
+      if (w.chat_id !== w.user_id) {
+        if (!groups.has(w.chat_id)) groups.set(w.chat_id, w.chat_title);
+      }
+    } catch {
+      // blocked/deleted — counted as missed
+    }
+  }
+  db.prepare("UPDATE pending_requests SET status = 'served' WHERE LOWER(query) = LOWER(?) AND status = 'pending'").run(job.query);
+
+  const link = botUsername ? `https://t.me/${botUsername}?start=dm` : null;
+  for (const [gid, gtitle] of groups) {
+    try {
+      const kb = new InlineKeyboard();
+      if (link) kb.url('📩 Get in DM', link);
+      await bot.api.sendMessage(
+        gid,
+        `✅ "${job.query}" is now available!\nType it here or in my DM to get it.`,
+        kb.button ? { reply_markup: kb } : {}
+      );
+    } catch {}
+  }
+  try {
+    await bot.api.sendMessage(
+      config.ownerUserId,
+      `✅ Fetch #${jobId} done: "${job.query}" → served ${delivered}/${waiting.length}, announced in ${groups.size} group(s).`
+    );
+  } catch {}
 }
 
 async function renderAnimeRangePage(ctx, items) {
