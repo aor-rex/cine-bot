@@ -162,7 +162,9 @@ export async function searchTorrents(query) {
     .sort((a, b) => b.seeders - a.seeders)
     .slice(0, 30);
 
-  // Attach parsium parse for display + quality collapse
+  // Attach parsium parse for display + quality collapse.
+  // Full metadata is carried so the options screen can show titles,
+  // single-vs-batch badges, and ranges (nothing display-relevant dropped).
   return ranked.map((t) => {
     let parsed = null;
     try {
@@ -178,6 +180,9 @@ export async function searchTorrents(query) {
         season: parsed.season,
         episode: parsed.episode,
         absolute_episode: parsed.absolute_episode,
+        episode_end: parsed.episode_end,
+        edition: parsed.edition,
+        content_type: parsed.content_type,
         quality_norm: parsed.quality_norm,
         source: parsed.source,
         codec: parsed.codec,
@@ -187,7 +192,7 @@ export async function searchTorrents(query) {
   });
 }
 
-// Collapse to best-per-quality for the options screen
+// Collapse to best-per-quality for the options screen (legacy: no title grouping)
 export function collapseByQuality(candidates) {
   const seen = new Set();
   const out = [];
@@ -199,4 +204,87 @@ export function collapseByQuality(candidates) {
     if (out.length >= 5) break;
   }
   return out;
+}
+
+function normTitleText(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Identity for grouping: same show/movie/season-pack bucket together,
+// different titles or years never merge (Ben 10 2005 vs 2016 stay apart).
+function titleIdentity(c) {
+  const p = c.parsed;
+  if (!p?.title) return `raw:${normTitleText(c.name).slice(0, 40)}`;
+  const pack = p.season != null ? `s${p.season}` : (p.absolute_episode ?? p.episode) != null ? 'eps' : 'movie';
+  return `${normTitleText(p.title)}|${p.year || 0}|${pack}`;
+}
+
+// Fraction of query tokens present in the candidate's title (+year)
+function relevanceToQuery(c, queryToks) {
+  const p = c.parsed;
+  const hay = normTitleText([p?.title, p?.year].filter(Boolean).join(' ')) || normTitleText(c.name);
+  const hayToks = new Set(hay.split(' ').filter(Boolean));
+  if (!queryToks.length) return 0;
+  const hit = queryToks.filter((t) => hayToks.has(t)).length;
+  return hit / queryToks.length;
+}
+
+// Group candidates by title identity, rank groups by query relevance then
+// seeders, collapse best-per-quality within each group. Flat list out, in
+// display order, each tagged with _groupTitle/_groupYear/_relevance.
+export function groupOptionsByTitle(candidates, query, { maxGroups = 3, maxTotal = 6, minRelevance = 0.34 } = {}) {
+  const queryToks = normTitleText(query).split(' ').filter((t) => t.length > 1);
+  const groups = new Map();
+  for (const c of candidates) {
+    const key = titleIdentity(c);
+    if (!groups.has(key)) groups.set(key, { key, items: [], title: c.parsed?.title || c.name, year: c.parsed?.year ?? null });
+    groups.get(key).items.push(c);
+  }
+  for (const g of groups.values()) {
+    g.items.sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+    g.relevance = Math.max(...g.items.map((c) => relevanceToQuery(c, queryToks)));
+    g.topSeeders = g.items[0]?.seeders || 0;
+  }
+  let ranked = [...groups.values()].sort((a, b) => b.relevance - a.relevance || b.topSeeders - a.topSeeders);
+  // Relevance floor drops wrong-title groups — but never drop everything.
+  const passing = ranked.filter((g) => g.relevance >= minRelevance);
+  if (passing.length) ranked = passing;
+  ranked = ranked.slice(0, maxGroups);
+  const out = [];
+  for (const g of ranked) {
+    const seen = new Set();
+    for (const c of g.items) {
+      const q = (c.parsed?.quality_norm || 'unknown').toLowerCase();
+      if (seen.has(q)) continue;
+      seen.add(q);
+      out.push({ ...c, _groupTitle: g.title, _groupYear: g.year, _relevance: g.relevance });
+      if (out.length >= maxTotal) break;
+    }
+    if (out.length >= maxTotal) break;
+  }
+  return out;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+// Single vs batch vs movie badge for option lines + confirm screen
+export function releaseBadge(c) {
+  const p = c.parsed || {};
+  const ed = String(p.edition || '').toLowerCase();
+  if (ed.includes('complete')) return '📦 Complete series';
+  if (ed.includes('season-pack') || (p.season != null && p.episode == null && p.episode_end == null)) {
+    return p.season != null ? `📦 S${pad2(p.season)} pack` : '📦 Season pack';
+  }
+  if (ed.includes('batch')) return '📦 Batch';
+  if (p.episode_end != null && (p.episode != null || p.absolute_episode != null)) {
+    return `📦 E${p.absolute_episode ?? p.episode}–E${p.episode_end}`;
+  }
+  if (p.season != null && p.episode != null) return `📺 S${pad2(p.season)}E${pad2(p.episode)}`;
+  if (p.season != null) return `📺 S${pad2(p.season)}`;
+  const ep = p.absolute_episode ?? p.episode;
+  if (ep != null) return `📺 E${ep}`;
+  if (p.year != null || p.content_type === 'movie') return '🎬 Movie';
+  return '🎬';
 }

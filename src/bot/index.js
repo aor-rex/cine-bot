@@ -735,14 +735,17 @@ export async function startBot() {
     const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
     const p = opt.parsed || {};
     const size = opt.size ? ` · ${formatSize(opt.size)}` : '';
+    const { releaseBadge } = await import('../fetch/sources.js');
+    const badge = opt._badge || releaseBadge(opt);
     const keyboard = new InlineKeyboard();
     keyboard.text('✅ Fetch & Send', `fetchgo_${pendingId}_${idx}`).row();
     keyboard.text('◀ Options', `fetchq_${pendingId}`).text('❌ Cancel', 'cancel');
     await ctx.editMessageText(
-      `📦 **${p.title || opt.name}**${p.year ? ` (${p.year})` : ''}\n`
+      `📦 **${p.title || opt.name}**${p.year ? ` (${p.year})` : ''} · ${badge}\n`
       + `${opt.cached ? '⚡ Cached — ready in ~1 min' : '⏳ Uncached — queued, slower'}\n`
       + `🎞 ${(p.quality_norm || '?').toUpperCase()} ${(p.source || '')} ${(p.codec || '')}\n`
-      + `💾${size} · ${opt.seeders} seeds · by ${p.release_group || opt.source}`,
+      + `💾${size} · ${opt.seeders} seeds · by ${p.release_group || opt.source}\n`
+      + `\`${String(opt.name).slice(0, 120)}\``,
       { reply_markup: keyboard, parse_mode: 'Markdown' }
     );
     await ctx.answerCallbackQuery();
@@ -1705,14 +1708,25 @@ function sourceIcon(source) {
   return '🎬';
 }
 
-function fetchOptionLabel(o) {
+function fetchOptionLabel(o, i) {
   const p = o.parsed || {};
   const mark = o.cached ? '⚡' : '⏳';
+  const title = p.title || o._groupTitle || 'Unknown title';
+  const year = p.year || o._groupYear ? ` (${p.year || o._groupYear})` : '';
   const q = (p.quality_norm || '?').toUpperCase();
-  const src = p.source || '';
-  const codec = p.codec || '';
+  return `${i + 1} · ${mark} ${title}${year} ${q}`.replace(/\s+/g, ' ').trim();
+}
+
+function fetchOptionLine(o, i) {
+  const p = o.parsed || {};
+  const mark = o.cached ? '⚡' : '⏳';
+  const title = p.title || o._groupTitle || o.name;
+  const year = p.year || o._groupYear ? ` (${p.year || o._groupYear})` : '';
+  const badge = o._badge || '';
+  const q = (p.quality_norm || '?').toUpperCase();
+  const specs = [q, p.source, p.codec].filter(Boolean).join(' ');
   const size = o.size ? ` · ${formatSize(o.size)}` : '';
-  return `${mark} ${q} ${src} ${codec}${size} · ${o.seeders} seeds`.replace(/\s+/g, ' ').trim();
+  return `${i + 1}. **${title}${year}**${badge ? ` · ${badge}` : ''}\n   ${specs}${size} · ${o.seeders} seeds ${mark}`;
 }
 
 function isOwnerCtx(ctx) {
@@ -1731,7 +1745,7 @@ async function renderFetchOptions(ctx, pendingId) {
     return ctx.editMessageText('❌ `TORBOX_API_KEY` is not set on the server.', { parse_mode: 'Markdown' });
   }
   await ctx.editMessageText(`🌊 Searching torrents for "${pend.query}"...`);
-  const { searchTorrents, collapseByQuality } = await import('../fetch/sources.js');
+  const { searchTorrents, groupOptionsByTitle, releaseBadge } = await import('../fetch/sources.js');
   const { checkCached } = await import('../fetch/debrid.js');
   let candidates = [];
   try {
@@ -1742,20 +1756,25 @@ async function renderFetchOptions(ctx, pendingId) {
   if (!candidates.length) {
     return ctx.editMessageText(`❌ No torrents found for "${pend.query}".`);
   }
-  const options = collapseByQuality(candidates);
+  const options = groupOptionsByTitle(candidates, pend.query);
+  if (!options.length) {
+    return ctx.editMessageText(`❌ No relevant torrents found for "${pend.query}". Try a more exact title.`);
+  }
   for (const o of options) {
     try {
       o.cached = (await checkCached(o.magnet)).cached;
     } catch { o.cached = false; }
+    o._badge = releaseBadge(o);
   }
   fetchOptionCache.set(pendingId, options);
   const keyboard = new InlineKeyboard();
   for (let i = 0; i < options.length; i++) {
-    keyboard.text(fetchOptionLabel(options[i]), `fetchpick_${pendingId}_${i}`).row();
+    keyboard.text(fetchOptionLabel(options[i], i), `fetchpick_${pendingId}_${i}`).row();
   }
   keyboard.text('❌ Cancel', 'cancel');
+  const lines = options.map((o, i) => fetchOptionLine(o, i)).join('\n');
   await ctx.editMessageText(
-    `🌊 **${pend.query}** — ${options.length} options:`,
+    `🌊 **${pend.query}** — pick one:\n${lines}`,
     { reply_markup: keyboard, parse_mode: 'Markdown' }
   );
 }
