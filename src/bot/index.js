@@ -18,6 +18,9 @@ const inflightRequests = new Set();
 const pendingTitlePrompt = new Set();
 // Owner fetch option stash: pendingId -> ranked torrent candidates
 const fetchOptionCache = new Map();
+// Pager memory: pendingId -> last viewed options page
+const fetchPageCache = new Map();
+const FETCH_OPTIONS_PER_PAGE = 5;
 
 function mainKeyboard() {
   return new Keyboard()
@@ -723,6 +726,12 @@ export async function startBot() {
     await renderFetchOptions(ctx, pendingId);
   });
 
+  // ── Owner fetch: paged options, cache-backed (no refetch) ──
+  bot.callbackQuery(/^fetchpage_(\d+)_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    await renderFetchOptionsCached(ctx, Number(ctx.match[1]), Number(ctx.match[2]));
+  });
+
   // ── Owner fetch: confirm one option ──────────────────────
   bot.callbackQuery(/^fetchpick_(\d+)_(\d+)$/, async (ctx) => {
     if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
@@ -739,7 +748,7 @@ export async function startBot() {
     const badge = opt._badge || releaseBadge(opt);
     const keyboard = new InlineKeyboard();
     keyboard.text('✅ Fetch & Send', `fetchgo_${pendingId}_${idx}`).row();
-    keyboard.text('◀ Options', `fetchq_${pendingId}`).text('❌ Cancel', 'cancel');
+    keyboard.text('◀ Back', `fetchback_${pendingId}`).text('❌ Cancel', 'cancel');
     await ctx.editMessageText(
       `📦 **${p.title || opt.name}**${p.year ? ` (${p.year})` : ''} · ${badge}\n`
       + `${opt.cached ? '⚡ Cached — ready in ~1 min' : '⏳ Uncached — queued, slower'}\n`
@@ -750,6 +759,12 @@ export async function startBot() {
     );
     await ctx.answerCallbackQuery();
     void pend;
+  });
+
+  // ── Owner fetch: back to cached options (no refetch) ───
+  bot.callbackQuery(/^fetchback_(\d+)$/, async (ctx) => {
+    if (ctx.from?.id !== config.ownerUserId) return ctx.answerCallbackQuery('⛔ Owner only.');
+    await renderFetchOptionsCached(ctx, Number(ctx.match[1]));
   });
 
   // ── Owner fetch: queue + run ─────────────────────────────
@@ -1708,13 +1723,16 @@ function sourceIcon(source) {
   return '🎬';
 }
 
-function fetchOptionLabel(o, i) {
+export function fetchOptionLabel(o) {
   const p = o.parsed || {};
   const mark = o.cached ? '⚡' : '⏳';
-  const title = p.title || o._groupTitle || 'Unknown title';
+  const title = (p.title || o._groupTitle || 'Unknown').slice(0, 26);
   const year = p.year || o._groupYear ? ` (${p.year || o._groupYear})` : '';
+  const badge = o._badgeShort ? ` ${o._badgeShort}` : '';
   const q = (p.quality_norm || '?').toUpperCase();
-  return `${i + 1} · ${mark} ${title}${year} ${q}`.replace(/\s+/g, ' ').trim();
+  const size = o.size ? ` ${formatCompactSize(o.size)}` : '';
+  const label = `${mark} ${title}${year}${badge} ${q}${size} ·${o.seeders}`;
+  return label.length > 60 ? `${label.slice(0, 59)}…` : label;
 }
 
 function fetchOptionLine(o, i) {
@@ -1765,18 +1783,52 @@ async function renderFetchOptions(ctx, pendingId) {
       o.cached = (await checkCached(o.magnet)).cached;
     } catch { o.cached = false; }
     o._badge = releaseBadge(o);
+    o._badgeShort = releaseBadge(o, true);
   }
   fetchOptionCache.set(pendingId, options);
+  options.__totalFound = candidates.length;
+  fetchPageCache.set(pendingId, 0);
+  await renderFetchOptionsPage(ctx, pend, options, 0, candidates.length);
+}
+
+async function renderFetchOptionsPage(ctx, pend, options, page, totalFound) {
+  const totalPages = Math.max(1, Math.ceil(options.length / FETCH_OPTIONS_PER_PAGE));
+  const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
+  const start = currentPage * FETCH_OPTIONS_PER_PAGE;
+  const pageOptions = options.slice(start, start + FETCH_OPTIONS_PER_PAGE);
+  fetchPageCache.set(pend.id, currentPage);
   const keyboard = new InlineKeyboard();
-  for (let i = 0; i < options.length; i++) {
-    keyboard.text(fetchOptionLabel(options[i], i), `fetchpick_${pendingId}_${i}`).row();
+  for (let k = 0; k < pageOptions.length; k++) {
+    keyboard.text(fetchOptionLabel(pageOptions[k]), `fetchpick_${pend.id}_${start + k}`).row();
+  }
+  if (totalPages > 1) {
+    if (currentPage > 0) keyboard.text('◀ Prev', `fetchpage_${pend.id}_${currentPage - 1}`);
+    keyboard.text(`Page ${currentPage + 1}/${totalPages}`, 'noop');
+    if (currentPage < totalPages - 1) keyboard.text('Next ▶', `fetchpage_${pend.id}_${currentPage + 1}`);
+    keyboard.row();
   }
   keyboard.text('❌ Cancel', 'cancel');
-  const lines = options.map((o, i) => fetchOptionLine(o, i)).join('\n');
+  const lines = pageOptions.map((o, k) => fetchOptionLine(o, start + k)).join('\n');
+  const hidden = Math.max(0, totalFound - options.length);
+  const foot = hidden > 0 ? `\n(+${hidden} hidden — low relevance)` : '';
   await ctx.editMessageText(
-    `🌊 **${pend.query}** — pick one:\n${lines}`,
+    `🌊 **${pend.query}** — pick one:${foot}\n${lines}`,
     { reply_markup: keyboard, parse_mode: 'Markdown' }
   );
+}
+
+// Back from confirm: re-render cached options, no network, page preserved
+async function renderFetchOptionsCached(ctx, pendingId, page) {
+  const db = getDb();
+  const pend = db.prepare('SELECT * FROM pending_requests WHERE id = ?').get(pendingId);
+  const options = fetchOptionCache.get(pendingId);
+  if (!pend || !options?.length) {
+    await ctx.answerCallbackQuery('Options expired — reopen from search.').catch(() => {});
+    return;
+  }
+  const totalFound = options.__totalFound ?? options.length;
+  await renderFetchOptionsPage(ctx, pend, options, page ?? fetchPageCache.get(pendingId) ?? 0, totalFound);
+  await ctx.answerCallbackQuery().catch(() => {});
 }
 
 // ── Fetch completion pipeline: debrid -> backup channel -> index -> serve ──
@@ -1972,6 +2024,14 @@ function registerShutdownNotifications(bot) {
 async function notifyOwnerBotStatus(bot, text) {
   if (!config.ownerUserId) return;
   await bot.api.sendMessage(config.ownerUserId, text);
+}
+
+function formatCompactSize(bytes) {
+  if (!bytes) return '';
+  const units = ['B', 'K', 'M', 'G', 'T'];
+  let i = 0; let size = bytes;
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
+  return `${size >= 100 ? Math.round(size) : size.toFixed(1)}${units[i]}`;
 }
 
 function formatSize(bytes) {

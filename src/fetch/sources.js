@@ -232,7 +232,8 @@ function relevanceToQuery(c, queryToks) {
 // Group candidates by title identity, rank groups by query relevance then
 // seeders, collapse best-per-quality within each group. Flat list out, in
 // display order, each tagged with _groupTitle/_groupYear/_relevance.
-export function groupOptionsByTitle(candidates, query, { maxGroups = 3, maxTotal = 6, minRelevance = 0.34 } = {}) {
+// No display cap here — the caller paginates the full passing set.
+export function groupOptionsByTitle(candidates, query, { maxGroups = 20, maxTotal = 100, minRelevance = 0.34 } = {}) {
   const queryToks = normTitleText(query).split(' ').filter((t) => t.length > 1);
   const groups = new Map();
   for (const c of candidates) {
@@ -269,22 +270,24 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-// Single vs batch vs movie badge for option lines + confirm screen
-export function releaseBadge(c) {
+// Single vs batch vs movie badge for option lines + confirm screen.
+// short=true gives pager-button-safe forms (S01E05, E01–E12, Complete…).
+export function releaseBadge(c, short = false) {
   const p = c.parsed || {};
   const ed = String(p.edition || '').toLowerCase();
-  if (ed.includes('complete')) return '📦 Complete series';
+  if (ed.includes('complete')) return short ? 'Complete' : '📦 Complete series';
   if (ed.includes('season-pack') || (p.season != null && p.episode == null && p.episode_end == null)) {
+    if (short) return p.season != null ? `S${pad2(p.season)} pack` : 'Season pack';
     return p.season != null ? `📦 S${pad2(p.season)} pack` : '📦 Season pack';
   }
-  if (ed.includes('batch')) return '📦 Batch';
+  if (ed.includes('batch')) return short ? 'Batch' : '📦 Batch';
   if (p.episode_end != null && (p.episode != null || p.absolute_episode != null)) {
-    return `📦 E${p.absolute_episode ?? p.episode}–E${p.episode_end}`;
+    return `E${p.absolute_episode ?? p.episode}–E${p.episode_end}`;
   }
-  if (p.season != null && p.episode != null) return `📺 S${pad2(p.season)}E${pad2(p.episode)}`;
-  if (p.season != null) return `📺 S${pad2(p.season)}`;
+  if (p.season != null && p.episode != null) return `S${pad2(p.season)}E${pad2(p.episode)}`;
+  if (p.season != null) return `S${pad2(p.season)}`;
   const ep = p.absolute_episode ?? p.episode;
-  if (ep != null) return `📺 E${ep}`;
-  if (p.year != null || p.content_type === 'movie') return '🎬 Movie';
-  return '🎬';
+  if (ep != null) return short ? `E${ep}` : `📺 E${ep}`;
+  if (p.year != null || p.content_type === 'movie') return short ? 'Movie' : '🎬 Movie';
+  return short ? '' : '🎬';
 }
