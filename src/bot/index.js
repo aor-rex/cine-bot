@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard, Keyboard } from 'grammy';
 import { config } from '../config.js';
 import { getDb } from '../db/index.js';
+import { rescueTrailingNumber } from '../parser/index.js';
 import { initScan } from '../init-scan.js';
 
 let bot;
@@ -352,7 +353,7 @@ export async function startBot() {
     const keyboard = new InlineKeyboard();
     const shown = [...groups.values()].slice(0, 8);
     for (const g of shown) {
-      const eps = new Set(g.items.map((i) => i.absolute_episode ?? (i.season != null ? `${i.season}:${i.episode}` : i.episode)).filter((e) => e != null)).size;
+      const eps = new Set(g.items.map(displayEp).filter((e) => e != null)).size;
       const quals = [...new Set(g.items.map((i) => (i.quality_norm || i.resolution || '').toUpperCase()).filter(Boolean))].slice(0, 2);
       const meta = [eps ? `${eps} ep${eps === 1 ? '' : 's'}` : null, quals.join('/') || null].filter(Boolean).join(' · ');
       const label = `${g.year ? `${g.title} (${g.year})` : g.title}${meta ? ` — ${meta}` : ''}`;
@@ -1705,8 +1706,27 @@ function dmDeepLink() {
 
 // Normalized grouping key: case/punctuation-insensitive so per-episode
 // title variants ("Fate Zero", "Fate/Zero", "fate_zero") merge into one.
+// A trailing bare number ("fatezero24") is also folded in — it's an episode
+// marker parsium couldn't classify, never part of the name. Season markers
+// ("...season2") are left alone so seasons never merge.
 function normTitleKey(t) {
-  return String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const k = String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const m = k.match(/^(.*?)(\d{1,4})$/);
+  if (m && m[1].length >= 3 && !/(season|saison|temporada|series|part|cour|s|2nd|3rd)$/.test(m[1])) {
+    const num = Number(m[2]);
+    if (num < 1900 || num > 2100) return m[1];
+  }
+  return k;
+}
+
+// Episode number for display counts: stored fields first, rescued trailing
+// number for rows indexed before the parser fix ("Fate Zero 24" -> 24).
+function displayEp(i) {
+  if (i.absolute_episode != null) return i.absolute_episode;
+  if (i.season != null) return `${i.season}:${i.episode}`;
+  if (i.episode != null) return i.episode;
+  const r = rescueTrailingNumber(i.title);
+  return r && r.episode != null ? r.episode : null;
 }
 
 // Whitelist sanitizer: only letters/numbers/spaces survive (unicode-aware,
