@@ -8,13 +8,13 @@
     "login": "node src/login.js"
   },
   "dependencies": {
-    "@grammyjs/conversations": "^2.1.0",
-    "better-sqlite3": "^12.11.1",
-    "dotenv": "^16.4.0",
     "grammy": "^1.42.0",
+    "@grammyjs/conversations": "^2.1.0",
+    "telegram": "^2.26.0",
     "parsium-media": "^1.0.0",
-    "pino": "^9.0.0",
-    "telegram": "^2.26.0"
+    "better-sqlite3": "^12.4.0",
+    "dotenv": "^16.4.0",
+    "pino": "^9.0.0"
   },
   "allowScripts": {
     "better-sqlite3@12.11.1": true
