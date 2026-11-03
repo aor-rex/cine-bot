@@ -84,6 +84,22 @@ function mapParsium(p, originalFilename, db) {
   let title = (p.title || '').trim();
   if (db) title = applyTitleOverrides(db, title);
 
+  // Anime files often carry a bare trailing number parsium can't classify
+  // ("Fate Zero 24", "Show 13"). Rescue it: season-marker -> season,
+  // otherwise -> episode (+absolute, anime-style). Never touch version
+  // tags ("Show v2"), year-like numbers, or stub remainders ("86" stays).
+  if (season == null && episode == null && absolute_episode == null) {
+    const rescued = rescueTrailingNumber(title);
+    if (rescued) {
+      title = rescued.title;
+      if (rescued.season != null) season = rescued.season;
+      else {
+        episode = rescued.episode;
+        absolute_episode = rescued.episode;
+      }
+    }
+  }
+
   return {
     title,
     year: p.year != null ? Number(p.year) : null,
@@ -107,6 +123,22 @@ function mapParsium(p, originalFilename, db) {
     file_size: null,
     raw_filename: originalFilename,
   };
+}
+
+// Trailing-number rescue shared by the parser (index time) and the bot
+// (display counts for rows indexed before this fix). Returns null when
+// the tail isn't a safe episode/season number.
+export function rescueTrailingNumber(title) {
+  const m = String(title || '').match(/^(.*)[\s._-]+(\d{1,4})$/);
+  if (!m) return null;
+  const base = m[1].trim();
+  const num = Number(m[2]);
+  if (num >= 1900 && num <= 2100) return null; // year, not episode
+  if (base.length < 3 || /v$/i.test(base)) return null; // "86", "Show v2"
+  const sm = base.match(/^(.*)[\s._-]+(season|saison|temporada|series|part|cour)$/i);
+  if (sm && sm[1].trim().length >= 2) return { title: sm[1].trim(), season: num };
+  if (/(season|saison|temporada|series|part|cour|2nd|3rd)$/i.test(base)) return null;
+  return { title: base, episode: num };
 }
 
 export function applyTitleOverrides(db, title) {
