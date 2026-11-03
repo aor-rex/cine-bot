@@ -330,11 +330,23 @@ export async function startBot() {
 
     const groups = new Map();
     for (const r of results) {
-      const key = `${r.title}|${r.year || 0}`;
+      // Normalized key: "Fate Zero" / "Fate/Zero" / "fate_zero" all merge.
+      // Year is display-only (mode), never a split — files with/without
+      // a parsed year belong to the same series.
+      const key = normTitleKey(r.title);
       if (!groups.has(key)) {
-        groups.set(key, { title: r.title, year: r.year, items: [] });
+        groups.set(key, { title: r.title, titles: new Map(), years: new Map(), items: [] });
       }
-      groups.get(key).items.push(r);
+      const g = groups.get(key);
+      g.titles.set(r.title, (g.titles.get(r.title) || 0) + 1);
+      if (r.year != null) g.years.set(r.year, (g.years.get(r.year) || 0) + 1);
+      g.items.push(r);
+    }
+    for (const g of groups.values()) {
+      // Display title = most common spelling; year only if unanimous.
+      g.title = [...g.titles.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      const years = [...g.years.keys()];
+      g.year = years.length === 1 ? years[0] : null;
     }
 
     const keyboard = new InlineKeyboard();
@@ -390,19 +402,24 @@ export async function startBot() {
     } catch {
       return ctx.answerInlineQuery([]);
     }
-    const seen = new Set();
-    const articles = [];
+    // Group variant spellings first so episode counts span all of them.
+    const igroups = new Map();
     for (const r of rows) {
-      const key = `${r.title}|${r.year || 0}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const key = normTitleKey(r.title);
+      if (!igroups.has(key)) igroups.set(key, { rep: r, titles: new Set() });
+      igroups.get(key).titles.add(r.title);
+    }
+    const articles = [];
+    for (const g of igroups.values()) {
       if (articles.length >= 10) break;
+      const r = g.rep;
+      const placeholders = [...g.titles].map(() => '?').join(',');
       const stats = db.prepare(`
         SELECT COUNT(*) AS n,
                COUNT(DISTINCT COALESCE(absolute_episode, episode)) AS eps,
                MAX(COALESCE(quality_norm, resolution)) AS q
-        FROM media_index WHERE title = ?
-      `).get(r.title);
+        FROM media_index WHERE title IN (${placeholders})
+      `).get(...g.titles);
       const desc = `${stats.eps || stats.n} episode(s)${r.year ? ` · ${r.year}` : ''}${stats.q ? ` · ${stats.q}` : ''}`;
       articles.push({
         type: 'article',
@@ -1684,6 +1701,12 @@ async function sendTrending(ctx, isEdit = false) {
 
 function dmDeepLink() {
   return botUsername ? `https://t.me/${botUsername}?start=dm` : null;
+}
+
+// Normalized grouping key: case/punctuation-insensitive so per-episode
+// title variants ("Fate Zero", "Fate/Zero", "fate_zero") merge into one.
+function normTitleKey(t) {
+  return String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 }
 
 // Whitelist sanitizer: only letters/numbers/spaces survive (unicode-aware,
