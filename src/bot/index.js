@@ -294,36 +294,17 @@ export async function startBot() {
 
     const db = getDb();
     const ftsQuery = sanitizeFtsQuery(query);
+    const normQ = ftsQuery.toLowerCase();
     let results = [];
-    if (ftsQuery) {
-      results = db.prepare(`
-        SELECT m.id, m.title, m.year, m.season, m.episode,
-               m.absolute_episode, m.resolution, m.quality_norm, m.codec,
-               m.source, m.file_type, m.file_size, m.source_msg_id
-        FROM media_fts
-        JOIN media_index m ON m.id = media_fts.rowid
-        WHERE media_fts MATCH ?
-        ORDER BY media_fts.rank
-        LIMIT 50
-      `).all(ftsQuery);
-    }
-    // AND yielded nothing: retry as token-OR before fuzzy/miss path
-    if (results.length === 0) {
-      const orQuery = orFtsQuery(ftsQuery);
-      if (orQuery && orQuery !== ftsQuery) {
-        try {
-          results = db.prepare(`
-            SELECT m.id, m.title, m.year, m.season, m.episode,
-                   m.absolute_episode, m.resolution, m.quality_norm, m.codec,
-                   m.source, m.file_type, m.file_size, m.source_msg_id
-            FROM media_fts
-            JOIN media_index m ON m.id = media_fts.rowid
-            WHERE media_fts MATCH ?
-            ORDER BY media_fts.rank
-            LIMIT 50
-          `).all(orQuery);
-        } catch {}
-      }
+    // Pass 1: title-column AND (no release-group cross-matching).
+    // Pass 2: all-column AND. Pass 3: token-OR. First pass with hits wins.
+    const passes = [titleFtsQuery(ftsQuery), ftsQuery, orFtsQuery(ftsQuery)]
+      .filter((p, i, a) => p && a.indexOf(p) === i);
+    for (const expr of passes) {
+      try {
+        results = ftsSearch(db, expr, normQ);
+      } catch { results = []; }
+      if (results.length > 0) break;
     }
 
     if (results.length === 0) {
@@ -389,15 +370,23 @@ export async function startBot() {
       });
     }
     const db = getDb();
+    const ftsQ = sanitizeFtsQuery(q);
+    const normInline = ftsQ.toLowerCase();
     let rows = [];
     try {
-      rows = db.prepare(`
-        SELECT m.id, m.title, m.year FROM media_fts
-        JOIN media_index m ON m.id = media_fts.rowid
-        WHERE media_fts MATCH ?
-        ORDER BY media_fts.rank
-        LIMIT 30
-      `).all(q);
+      const exprs = [titleFtsQuery(ftsQ), ftsQ].filter((p, i, a) => p && a.indexOf(p) === i);
+      for (const expr of exprs) {
+        try {
+          rows = db.prepare(`
+            SELECT m.id, m.title, m.year FROM media_fts
+            JOIN media_index m ON m.id = media_fts.rowid
+            WHERE media_fts MATCH ?
+            ORDER BY (lower(m.title) != ?), media_fts.rank
+            LIMIT 30
+          `).all(expr, normInline);
+        } catch { rows = []; }
+        if (rows.length > 0) break;
+      }
     } catch {
       return ctx.answerInlineQuery([]);
     }
@@ -1697,14 +1686,36 @@ function dmDeepLink() {
   return botUsername ? `https://t.me/${botUsername}?start=dm` : null;
 }
 
-// Strip FTS5 operators from user text so punctuation can't zero-out/throw MATCH.
-// Also splits CJK/emoji-adjacent runs by treating non-alphanumerics as spaces.
+// Whitelist sanitizer: only letters/numbers/spaces survive (unicode-aware,
+// so CJK still works). Kills every FTS5 operator (`/ " * : ^ ( ) - +` …)
+// at the source — no user input can throw MATCH anymore.
 function sanitizeFtsQuery(q) {
   return String(q || '')
-    .replace(/["()*^:]/g, ' ')
-    .replace(/[-–—]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+// Title-column AND: every token must appear in the title itself.
+// Quoted per-token so reserved words (or/not/near) can't break the query.
+function titleFtsQuery(sanitized) {
+  const toks = String(sanitized || '').split(' ').filter(Boolean);
+  if (!toks.length) return '';
+  return toks.map((t) => `{title} : "${t.replace(/"/g, '')}"`).join(' AND ');
+}
+
+// Shared search body: exact (case-insensitive) title first, then bm25 rank.
+function ftsSearch(db, matchExpr, normQ) {
+  return db.prepare(`
+    SELECT m.id, m.title, m.year, m.season, m.episode,
+           m.absolute_episode, m.resolution, m.quality_norm, m.codec,
+           m.source, m.file_type, m.file_size, m.source_msg_id
+    FROM media_fts
+    JOIN media_index m ON m.id = media_fts.rowid
+    WHERE media_fts MATCH ?
+    ORDER BY (lower(m.title) != ?), media_fts.rank
+    LIMIT 50
+  `).all(matchExpr, normQ || '');
 }
 
 // Token-OR form for recall fallback: "brand new day" -> "brand OR new OR day"
